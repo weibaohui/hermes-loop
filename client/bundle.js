@@ -9,6 +9,8 @@
 window.__ModuleLoader__.load({
   id: 'dsh-plugin-hermes-loop',
   factory: (require) => {
+    var module = { exports: {} }
+    var exports = module.exports
     var React = require('react')
     var h = React.createElement
 
