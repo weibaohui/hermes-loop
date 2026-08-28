@@ -313,5 +313,7 @@ window.__ModuleLoader__.load({
         })
       },
     }
+
+    return module.exports
   },
 })
