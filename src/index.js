@@ -18,8 +18,9 @@ const { createHash, randomUUID } = require('node:crypto')
 const fsP = require('node:fs/promises')
 const { join, resolve, sep } = require('node:path')
 const { homedir } = require('node:os')
-let zod = null
-try { zod = require('zod') } catch { zod = null }
+// settings 服务要求 schemastery schema（需要可调用校验 + toJSON，zod 不兼容）
+let Schema = null
+try { Schema = require('@deepseek-ai/schemastery') } catch { Schema = null }
 
 const KEbab_NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 const DESCRIPTION_MAX = 500
@@ -27,6 +28,22 @@ const BODY_MAX_CHARS = 128 * 1024
 const SUSPECT_BODY_MAX_CHARS = 8 * 1024
 const TRANSCRIPT_MESSAGE_CAP = 40
 const TRANSCRIPT_MESSAGE_CHARS = 4000
+
+/**
+ * Audit/activity trail: append one JSON line per loop event to
+ * `$DSH_HOME/hermes-loop/activity.jsonl`. Plugin `ctx.logger` output is
+ * filtered by the host's log exporters, so the loop keeps its own record —
+ * also the audit ledger for review-triggered writes (design §7).
+ */
+function makeTracer() {
+  const file = join(dshHome(), 'hermes-loop', 'activity.jsonl')
+  return (event, data = {}) => {
+    const line = JSON.stringify({ at: new Date().toISOString(), event, ...data }) + '\n'
+    fsP.mkdir(join(file, '..'), { recursive: true })
+      .then(() => fsP.appendFile(file, line, 'utf8'))
+      .catch(() => {})
+  }
+}
 
 const DEFAULTS = {
   enabled: true,
@@ -44,20 +61,20 @@ const DEFAULTS = {
 }
 
 function settingsSchema() {
-  if (!zod) return null
-  return zod.object({
-    enabled: zod.boolean(),
-    mode: zod.enum(['auto', 'approval', 'log-only']),
-    provider: zod.string(),
-    model: zod.string(),
-    turnInterval: zod.number().int().min(1),
-    toolCallInterval: zod.number().int().min(0),
-    cooldownMinutes: zod.number().int().min(0),
-    maxTranscriptChars: zod.number().int().min(1000),
-    reviewTimeoutSec: zod.number().int().min(30),
-    catalogDescriptionMax: zod.number().int().min(50),
-    suspectsTopN: zod.number().int().min(0).max(10),
-    maxTranscriptMessages: zod.number().int().min(5).max(400),
+  if (!Schema) return null
+  return Schema.object({
+    enabled: Schema.boolean().default(true),
+    mode: Schema.union(['auto', 'approval', 'log-only']).default('auto'),
+    provider: Schema.string().default(''),
+    model: Schema.string().default(''),
+    turnInterval: Schema.number().min(1).default(10),
+    toolCallInterval: Schema.number().min(0).default(10),
+    cooldownMinutes: Schema.number().min(0).default(30),
+    maxTranscriptChars: Schema.number().min(1000).default(12000),
+    reviewTimeoutSec: Schema.number().min(30).default(300),
+    catalogDescriptionMax: Schema.number().min(50).default(500),
+    suspectsTopN: Schema.number().min(0).max(10).default(3),
+    maxTranscriptMessages: Schema.number().min(5).max(400).default(40),
   })
 }
 
@@ -313,7 +330,10 @@ function reviewPrompt() {
 
 module.exports = {
   name: 'hermes-loop',
-  inject: ['skills'],
+  // 静态注入：apply 在这些服务就绪后才运行（at-file 同款模式）。
+  // 动态 ctx.inject(['settings'], cb) 在 apply 内不会触发——skills-management 的
+  // settings 注册就是这么静默失效的（平台 gotcha）。
+  inject: ['skills', 'settings', 'agents', 'agentDefaultModel'],
   __internals: {
     reasonKind, contentToText, renderTranscript, tokenize, rankSuspects,
     extractFencedJson, parseConclusion, sha256, buildSkillMd, applyConclusion,
@@ -321,18 +341,14 @@ module.exports = {
   },
 
   apply(ctx, config = {}) {
+    const trace = makeTracer()
+    trace('armed', { pid: process.pid, config: { ...DEFAULTS, ...config } })
     let settingsScope = null
-    try {
-      if (ctx.inject && typeof ctx.inject === 'function') {
-        ctx.inject(['settings'], (settingsCtx) => {
-          const schema = settingsSchema()
-          if (schema && settingsCtx && settingsCtx.settings && typeof settingsCtx.settings.register === 'function') {
-            try { settingsScope = settingsCtx.settings.register('hermes-loop', schema, { base: { ...DEFAULTS, ...config } }) }
-            catch (e) { ctx.logger.warn(`hermes-loop: settings register: ${e && e.message}`) }
-          }
-        })
-      }
-    } catch {}
+    const schema = settingsSchema()
+    if (schema && ctx.settings && typeof ctx.settings.register === 'function') {
+      try { settingsScope = ctx.settings.register('hermes-loop', schema, { base: { ...DEFAULTS, ...config } }) }
+      catch (e) { ctx.logger.warn(`hermes-loop: settings register: ${e && e.message}`) }
+    }
 
     const effective = () => {
       if (settingsScope && typeof settingsScope.get === 'function') {
@@ -341,15 +357,6 @@ module.exports = {
       }
       return { ...DEFAULTS, ...config }
     }
-
-    // Same-process Agent services (mirrors skills-management): without them
-    // the loop cannot run reviews and stays dormant with a warn.
-    let services = null
-    try {
-      if (ctx.inject && typeof ctx.inject === 'function') {
-        ctx.inject(['agents', 'agentDefaultModel'], (svcs) => { services = svcs })
-      }
-    } catch {}
 
     // ── Trigger state ──
     // windows: per-session counters since the last review entered the runner.
@@ -381,6 +388,7 @@ module.exports = {
       st.toolCalls = 0
       st.lastReviewAt = Date.now()
       running = { sessionId, controller }
+      trace('review-start', { sessionId })
 
       let handle
       try {
@@ -402,6 +410,7 @@ module.exports = {
           ? catalog.map((s) => `- ${s.name}: ${s.description}`).join('\n')
           : '（当前无可用 skill）'
         const suspects = rankSuspects(catalog, transcriptText).slice(0, eff.suspectsTopN)
+        trace('review-inputs', { sessionId, messages: messages.length, catalogSize: catalog.length, suspects: suspects.map((s) => s.name) })
         const suspectBlocks = []
         for (const suspect of suspects) {
           if (!suspect.resourceBase || suspect.resourceBase.kind !== 'directory' || typeof suspect.resourceBase.path !== 'string') continue
@@ -414,8 +423,8 @@ module.exports = {
         }
 
         // 3. zero-tool review agent（进程内、独立会话、不污染会话库）
-        const selection = services.agentDefaultModel.currentSelection()
-        handle = await services.agents.create({
+        const selection = ctx.agentDefaultModel.currentSelection()
+        handle = await ctx.agents.create({
           sessionId: 'hermes-loop-review-' + randomUUID(),
           meta: { cwd, agentPreset: 'standard', origin: 'subagent' },
           agentOptions: { provider: eff.provider || selection.provider, model: eff.model || selection.model },
@@ -423,6 +432,7 @@ module.exports = {
           setup: (agentCtx) => { agentCtx.tools.restrict({ allow: [] }) },
         })
         const agent = handle.agent
+        trace('review-agent-created', { reviewSession: agent.id })
 
         // 4. pump the final assistant message out of the session log
         const firstSeq = agent.session.seq
@@ -458,6 +468,7 @@ module.exports = {
           pump()
         }
 
+        trace('review-output', { sessionId, chars: finalText.length, head: finalText.slice(0, 200) })
         if (controller.signal.aborted) {
           ctx.logger.warn(`hermes-loop: review for session ${sessionId} aborted (timeout=${eff.reviewTimeoutSec}s / foreground priority)`)
           return
@@ -474,6 +485,9 @@ module.exports = {
           return
         }
         await dispatchConclusion(conclusion, { eff, sessionId })
+      } catch (e) {
+        trace('review-error', { sessionId, message: String(e && e.message || e) })
+        throw e
       } finally {
         running = null
         if (handle) { try { await handle.dispose() } catch {} }
@@ -483,6 +497,7 @@ module.exports = {
 
     const dispatchConclusion = async (conclusion, { eff, sessionId }) => {
       const logHead = `hermes-loop: ${conclusion.action} '${conclusion.skill}' (from session ${sessionId})`
+      trace('dispatch', { sessionId, mode: eff.mode, action: conclusion.action, skill: conclusion.skill })
       if (eff.mode === 'log-only') {
         ctx.logger.info(`${logHead} — log-only mode, not written. ${JSON.stringify(conclusion)}`)
         return
@@ -493,10 +508,12 @@ module.exports = {
         const payload = { id, at: new Date().toISOString(), sourceSession: sessionId, mode: eff.mode, globalDir: globalSkillsDir(), conclusion }
         await fsP.mkdir(dir, { recursive: true })
         await atomicWrite(join(dir, `${id}.json`), JSON.stringify(payload, null, 2))
+        trace('staged', { id, dir })
         ctx.logger.info(`${logHead} — staged to ${dir} for approval`)
         return
       }
       const outcome = await applyConclusion(conclusion, { globalDir: globalSkillsDir() })
+      trace('write-outcome', { skill: conclusion.skill, ...outcome })
       if (outcome.result === 'created' || outcome.result === 'patched') {
         ctx.logger.info(`${logHead} — ${outcome.result} → ${outcome.path}`)
       } else {
@@ -509,7 +526,7 @@ module.exports = {
       try {
         const eff = effective()
         if (!eff.enabled) return
-        if (!services || !services.agents) return
+        if (!ctx.agents || !ctx.agentDefaultModel) return
         const sessionId = session && session.id
         if (typeof sessionId !== 'string') return
         // 防自反馈：自己的 review 会话 + 一切 subagent 会话都不触发
@@ -532,6 +549,7 @@ module.exports = {
         const cooledDown = Date.now() - st.lastReviewAt >= eff.cooldownMinutes * 60 * 1000
         const hitTurn = eff.turnInterval > 0 && st.turns >= eff.turnInterval
         const hitTools = eff.toolCallInterval > 0 && st.toolCalls >= eff.toolCallInterval
+        trace('threshold', { sessionId, turns: st.turns, toolCalls: st.toolCalls, cooledDown, hitTurn, hitTools })
         if (!cooledDown || (!hitTurn && !hitTools)) return
 
         const task = () => runReview({ session, eff })
