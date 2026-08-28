@@ -1,0 +1,30 @@
+{
+  "name": "dsh-plugin-hermes-loop",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness plugin: Hermes-style learning loop — watches every session's turn/end events, distills valuable experience into reusable skills via a zero-tool background review agent.",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "skills",
+    "hermes",
+    "learning-loop"
+  ],
+  "main": "src/index.js",
+  "files": [
+    "src",
+    "cordis.patch.yml"
+  ],
+  "scripts": {
+    "check": "node --check src/index.js",
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=22.5"
+  },
+  "dependencies": {
+    "zod": "^3.25.76"
+  }
+}

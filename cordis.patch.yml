@@ -1,0 +1,11 @@
+# dsh-plugin-hermes-loop bundle patch: contributes the plugin row into the host
+# composition when this package is installed.
+#
+# The plugin is HOST-PLANE: it subscribes to all sessions' `session/event`
+# stream, runs in-process review agents through the shared `agents` service,
+# and writes skills into the user library. It must land in the host
+# composition (this insert), never inside an agent preset.
+
+- insert:
+    - id: hermes-loop
+      name: 'dsh-plugin-hermes-loop'
