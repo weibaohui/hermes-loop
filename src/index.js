@@ -365,6 +365,9 @@ module.exports = {
     const windows = new Map()
     const queued = new Map()
     let running = null
+    let runningSince = null
+
+    const activityFile = () => join(dshHome(), 'hermes-loop', 'activity.jsonl')
 
     const stateFor = (sessionId) => {
       let st = windows.get(sessionId)
@@ -388,6 +391,7 @@ module.exports = {
       st.toolCalls = 0
       st.lastReviewAt = Date.now()
       running = { sessionId, controller }
+      runningSince = new Date().toISOString()
       trace('review-start', { sessionId })
 
       let handle
@@ -490,6 +494,7 @@ module.exports = {
         throw e
       } finally {
         running = null
+        runningSince = null
         if (handle) { try { await handle.dispose() } catch {} }
         drainNext()
       }
@@ -572,6 +577,94 @@ module.exports = {
         if (running !== null) running.controller.abort() // runner finally 里 dispose agent
       }
     }, 'hermes-loop: session/event subscription')
+
+    // ── Client API（web 面板的唯一数据源；宿主面动态注入 webServer 是可用路径）──
+    const sendJson = (res, status, payload) => {
+      res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
+      res.end(JSON.stringify(payload))
+    }
+    const readJsonBody = (req) => new Promise((fulfil, reject) => {
+      let size = 0
+      const chunks = []
+      req.on('data', (chunk) => {
+        size += chunk.length
+        if (size > 64 * 1024) { reject(new Error('request body too large')); req.destroy(); return }
+        chunks.push(chunk)
+      })
+      req.on('end', () => {
+        try { fulfil(chunks.length === 0 ? {} : JSON.parse(Buffer.concat(chunks).toString('utf8'))) }
+        catch (error) { reject(new Error(`invalid JSON body: ${error && error.message}`)) }
+      })
+      req.on('error', reject)
+    })
+    const readActivityTail = async (limit = 60) => {
+      let raw
+      try { raw = await fsP.readFile(activityFile(), 'utf8') } catch { return [] }
+      const out = []
+      for (const line of raw.trimEnd().split('\n').slice(-limit)) {
+        try { out.push(JSON.parse(line)) } catch { /* skip damaged line */ }
+      }
+      return out
+    }
+    const loopSnapshot = async (sessionId) => {
+      const eff = effective()
+      const sessions = {}
+      for (const [sid, st] of windows) {
+        sessions[sid] = { turns: st.turns, toolCalls: st.toolCalls, lastReviewAt: st.lastReviewAt || undefined }
+      }
+      const activity = await readActivityTail()
+      const written = activity
+        .filter((e) => (e.event === 'write-outcome' && e.result) || e.event === 'staged')
+        .map((e) => ({
+          at: e.at,
+          action: e.event === 'staged' ? 'staged' : (e.action === 'patched' ? 'patch' : 'create'),
+          skill: e.skill,
+          result: e.event === 'staged' ? 'staged' : e.result,
+          path: e.path,
+        }))
+        .reverse()
+      const current = sessionId !== undefined && sessionId !== '' ? sessions[sessionId] : undefined
+      return {
+        settings: eff,
+        running: running !== null ? { sessionId: running.sessionId, startedAt: runningSince } : null,
+        queuedCount: queued.size,
+        sessions,
+        current: current || { turns: 0, toolCalls: 0, lastReviewAt: undefined },
+        activity,
+        written,
+      }
+    }
+
+    try {
+      ctx.inject(['webServer'], (webServerCtx) => {
+        ctx.effect(() => webServerCtx.webServer.register({
+          kind: 'prefix',
+          path: '/hermes-loop/api',
+          handler: async (req, res) => {
+            try {
+              const url = new URL(req.url || '/', 'http://dsh.local')
+              const apiPath = url.pathname.replace(/\/+$/, '')
+              if (req.method === 'GET' && apiPath.endsWith('/hermes-loop/api/status')) {
+                sendJson(res, 200, await loopSnapshot(url.searchParams.get('sessionId') || ''))
+                return
+              }
+              if (req.method === 'POST' && apiPath.endsWith('/hermes-loop/api/settings')) {
+                const body = await readJsonBody(req)
+                if (body === null || typeof body !== 'object' || body.patch === undefined || typeof body.patch !== 'object') {
+                  sendJson(res, 400, { error: 'body must provide patch object' })
+                  return
+                }
+                if (settingsScope && typeof settingsScope.update === 'function') await settingsScope.update(body.patch)
+                else Object.assign(config, body.patch) // 无 settings 服务时退化为运行时覆盖
+                sendJson(res, 200, { ok: true, settings: effective() })
+                return
+              }
+              sendJson(res, 404, { error: 'not found' })
+            } catch (error) { sendJson(res, 400, { error: String(error && error.message || error) }) }
+          },
+        }), 'hermes-loop: client api route')
+      })
+    } catch {}
 
     ctx.logger.info && ctx.logger.info('hermes-loop: learning loop armed (session/event subscription active)')
   },

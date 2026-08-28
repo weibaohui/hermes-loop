@@ -13,12 +13,18 @@
     "learning-loop"
   ],
   "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./client": "./client/bundle.js",
+    "./package.json": "./package.json"
+  },
   "files": [
     "src",
+    "client",
     "cordis.patch.yml"
   ],
   "scripts": {
-    "check": "node --check src/index.js",
+    "check": "node --check src/index.js && node --check client/bundle.js",
     "test": "node --test test/*.test.mjs"
   },
   "engines": {
@@ -26,5 +32,13 @@
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
   }
 }

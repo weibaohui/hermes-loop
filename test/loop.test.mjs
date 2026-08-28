@@ -178,6 +178,7 @@ function setupPlugin(config, services) {
   const cleanups = []
   const infos = []
   const warns = []
+  const routes = []
   const ctx = {
     logger: { info: (m) => infos.push(String(m)), warn: (m) => warns.push(String(m)) },
     on: (name, fn) => { handlers.push(fn); return () => {} },
@@ -187,10 +188,13 @@ function setupPlugin(config, services) {
     settings: undefined,
     ...services,
   }
+  // 宿主面动态注入 webServer（skills-management share-services 同款，已验证可用）
+  const calls = ctx.inject ? [...ctx.inject] : []
+  ctx.inject = (deps, cb) => { calls.push(deps); if (deps.includes('webServer')) cb({ webServer: { register: (route) => routes.push(route) } }) }
   plugin.apply(ctx, config)
   return {
     fire: (session, event) => { for (const h of handlers) h(session, event) },
-    infos, warns, cleanups,
+    infos, warns, cleanups, routes,
   }
 }
 
@@ -290,3 +294,70 @@ function fakeIdleAgent(text) {
     followup() {}, whenIdle: async () => {}, cancel() {},
   }
 }
+
+// ── client API routes (fake webServer) ─────────────────────────────────
+
+function fakeRes() {
+  const res = { statusCode: null, body: null }
+  res.writeHead = (status) => { res.statusCode = status }
+  res.end = (b) => { res.body = b }
+  return res
+}
+
+test('GET /hermes-loop/api/status exposes settings, per-session counters and written skills', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-api-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const services = fakeServices('```json\n{"action":"nothing"}\n```')
+    const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'log-only' }, services)
+    await new Promise((r) => setTimeout(r, 30))
+    assert.equal(t.routes.length, 1)
+    const route = t.routes[0]
+    assert.equal(route.path, '/hermes-loop/api')
+    const session = { id: 'session-api', header: {}, deriveMessages: () => [] }
+    t.fire(session, completedTurn)
+    await new Promise((r) => setTimeout(r, 80))
+    const res = fakeRes()
+    await route.handler({ method: 'GET', url: '/hermes-loop/api/status?sessionId=session-api' }, res)
+    const body = JSON.parse(res.body)
+    assert.equal(res.statusCode, 200)
+    assert.equal(body.settings.mode, 'log-only')
+    assert.equal(body.current.turns, 0) // 已被 review 消耗重置
+    assert.ok(body.sessions['session-api'].lastReviewAt > 0)
+    assert.ok(Array.isArray(body.activity) && body.activity.length > 0)
+    assert.ok(Array.isArray(body.written))
+    const notFound = fakeRes()
+    await route.handler({ method: 'GET', url: '/hermes-loop/api/nope' }, notFound)
+    assert.equal(notFound.statusCode, 404)
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('POST /hermes-loop/api/settings patches mode via settings scope', async () => {
+  const updates = []
+  const scope = { get: () => ({ mode: 'approval' }), update: async (patch) => { updates.push(patch) } }
+  const services = fakeServices('```json\n{"action":"nothing"}\n```')
+  const t = setupPlugin({ turnInterval: 5 }, { ...services, settings: { register: () => scope } })
+  await new Promise((r) => setTimeout(r, 20))
+  const route = t.routes[0]
+  const res = fakeRes()
+  await route.handler(reqBody({ patch: { mode: 'approval' } }), res)
+  const body = JSON.parse(res.body)
+  assert.equal(res.statusCode, 200)
+  assert.deepEqual(updates, [{ mode: 'approval' }])
+  assert.equal(body.settings.mode, 'approval')
+})
+
+function reqBody(obj) {
+  const data = JSON.stringify(obj)
+  const req = new (require('node:events').EventEmitter)()
+  req.method = 'POST'
+  req.url = '/hermes-loop/api/settings'
+  process.nextTick(() => { req.emit('data', Buffer.from(data)); req.emit('end') })
+  return req
+}
+reqBody.__doc = 'returns a live EventEmitter; route.handler must attach listeners synchronously'
