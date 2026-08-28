@@ -25,6 +25,6 @@
     "node": ">=22.5"
   },
   "dependencies": {
-    "zod": "^3.25.76"
+    "@deepseek-ai/schemastery": "^3.18.1"
   }
 }
