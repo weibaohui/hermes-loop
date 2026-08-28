@@ -7,6 +7,8 @@
 > ① dsh 宿主插件**可以**订阅所有会话的 turn 结束事件（v1 以为没有）；
 > ② skill 写入**不需要**跨插件 invalidate（chokidar watcher 自动失效）。
 > 因此触发方案从"主 agent 自报端点"升级为**与 Hermes 同构的 session/event 订阅**，prompt 自报降级为兜底。
+>
+> **v2.1 修订说明（2026-08-28 设计评审）**：① suspects 全文注入在 §2/§4.1/§6 三处对齐；② hermes-prompt 补 `ctx.provide('hermesPrompt')` 服务标记，探测由不可行的"隐式探测"改为 `ctx.get('hermesPrompt', false)`；③ 输出协议补 `baseHash`/`baseDescription` 字段，read-before-write 升级为两步（CAS + 原子 rename）；④ pending 路径对齐 `DSH_HOME`；⑤ 补 log-only 模式行为、生命周期清理、abort 链路伪代码、触发计数语义、skills-management rank 脚注。
 
 ## 0. 对等性结论：能，且保真度比 v1 方案高
 
@@ -35,7 +37,7 @@
 4. **agents.create**：`{ sessionId, meta: { cwd, agentPreset, origin }, agentOptions: { provider, model }, signal, setup }`（packages/core/agent/src/index.ts:405, types :80-133）；`followup(message)` source.kind 合法值 user/plugin/model/tool（llm/src/message.ts:100-105）；`whenIdle()`（runtime-types.ts:87-93）。
 5. **工具白名单**：`setup(agentCtx) => agentCtx.tools.restrict({ allow })`（packages/core/tools/src/index.ts:680-686；范例 subagent/src/child-agent.ts:157-176）。多条 restrict 相交。
 6. **skill 可见性**：`<available_skills>` 目录不是 system prompt，而是每个 agent pre-step 注入的 user message，description 归一化上限 **500 字符**（packages/skill/tool-skill/src/index.ts:27,390-394——不是 Hermes 的 60）；sha256 digest 对比，变化即替换目录消息（:220-236,279-311）。
-7. **skill 目录 rank**（skill-filesystem/src/index.ts:36-43,241-261）：项目 `<root>/.dsh/skills`(100) / `<root>/.agents/skills`(200) / custom(300) / 用户 `~/.dsh/skills`(400) / bundled(600)，项目级遮蔽用户级——**per-workspace skill 目录天然存在**（项目根按 cwd 向上找 .git 解析）。
+7. **skill 目录 rank**（skill-filesystem/src/index.ts:36-43,241-261）：项目 `<root>/.dsh/skills`(100) / `<root>/.agents/skills`(200) / custom(300) / 用户 `~/.dsh/skills`(400) / bundled(600)，项目级遮蔽用户级——**per-workspace skill 目录天然存在**（项目根按 cwd 向上找 .git 解析）。⚠️ 脚注：skills-management 插件对**同一个用户目录**（installedDir）注册了 rank=100 的 ntd-skills provider（skills-management/src/index.js:28），会遮蔽内置 user-dsh 的 rank=400 条目——同一 skill 出现双条目时以 rank 100 者为准。hermes-loop 只要写入的**目录路径正确**（`~/.dsh/skills/`，尊重 `DSH_HOME`），两个 provider 都能扫到，无需关心谁遮蔽谁。
 8. **frontmatter 校验**：必填 name（kebab-case `/^[a-z0-9]+(?:-[a-z0-9]+)*$/`）+ description 非空（skill/src/index.ts:20,34-36；skill-filesystem :810-819）；**没有 description 长度上限**（500 只是目录渲染截断）；不合法 warn 跳过、静默不可见。
 9. **systemPrompt section**：按 order 稳定排序，同 order 共存（core/system-prompt/src/index.ts:504）；同层同名 section 注册**抛错**（:316-318）——hermes-loop 的 section 名必须与 hermes-prompt 的 `hermes:discipline` 不同。
 10. **插件互通**：同一根层挂载的插件互相 `ctx.inject` 服务可用（无 isolate 调用，vendor/cordis/src/service.ts:61-63）；根层服务对 agent 子树可见，反之不可见（preset/mount.ts:14-16 的审计守卫）。
@@ -52,7 +54,10 @@
       ▼  达到阈值（或 digest 启发式命中信号词）
 review runner（串行队列，防堆积）
       │  transcript = session.deriveMessages()（末尾 N 条 + 截断）
-      │  catalog   = ctx.skills.snapshot()（name + description 清单）
+      │  catalog   = ctx.skills.snapshot({ cwd: session.header.cwd })
+      │             （name + description 清单；cwd 必传——不传拿不到项目级 skill）
+      │  suspects  = catalog 中与 transcript 关键词匹配的 top-N skill，
+      │             读全文注入（patch 质量的前提，见 §4.1/§8.1）
       │  agents.create({ sessionId: 'hermes-loop-review-'+uuid,
       │                  meta: { agentPreset: 'standard', origin: 'subagent' },
       │                  agentOptions: { provider, model },   // 可路由便宜模型
@@ -62,9 +67,11 @@ review runner（串行队列，防堆积）
       │  await whenIdle()，事件泵收集最终 assistant/message
       ▼  解析结构化结论 { action: nothing|create|patch, ... }
 skill writer
-      │  read-before-write 守卫（patch 前必须已读目标 skill）
+      │  CAS 守卫：patch 前重读目标文件比对 baseHash（§6 两步守卫①）
+      │  临时文件 + 原子 rename 写入（守卫②）
       │  frontmatter 校验（kebab-case name、非空 description、≤500 字符）
-      │  mode=auto → 写入目标目录；mode=approval → stage 到 pending/
+      │  mode=auto → 写入目标目录；mode=approval → stage 到 pending/；
+      │  mode=log-only → 仅 ctx.logger.info 输出结论，不落盘
       ▼
 可见性：chokidar watcher 自动 invalidate（~200ms）→ 下一会话 pre-step 可见
 ```
@@ -80,11 +87,28 @@ skill writer
 1. **排除自身**：sessionId 以 `hermes-loop-` 开头、或 `meta.origin === 'subagent'` 的会话不触发（防自反馈，对应 Hermes 的 cron 会话排除）；
 2. **排除 aborted/interrupted**：被中断的 turn 不复盘（Hermes 同款规则）；
 3. **计数触发**（阈值可配，默认对齐 Hermes）：
-   - `turnInterval`（默认 10）：该会话自上次 review 以来的 completed turn 数；
-   - `toolCallInterval`（默认 10，可选）：同窗口内 tool/call 事件数——Hermes 用它近似"这轮干了多少活"；
+   - `turnInterval`（默认 10）：该会话自上次 review 以来累计的 completed turn 数。**重置时机**：review 进入执行（进入 runner）即重置——被 abort 的 review 同样视为已消耗该窗口，不因 abort 而立刻重触发同一批 turn；
+   - `toolCallInterval`（默认 10，可选）：**自上次 review 以来的窗口累计** tool/call 事件数，与 turnInterval 平行、任一达标即触发。⚠️ 与 Hermes 原版有意差异：Hermes 是"单 turn 内工具迭代数"（turn_finalizer 单点决策），本设计改为窗口累计——事件订阅模型下没有单点收尾位置，窗口累计语义更稳定；
 4. **信号加速**（Hermes 没有、dsh 侧补的廉价启发式，可选）：窗口内的 tool/call 出现过高失败率、或 assistant 文本命中用户纠正词表（"不对/别这样/too verbose"等），可把阈值打折——v2 再做，v1 只用纯计数；
 5. **冷却**：同 session 两次 review 最小间隔 `cooldownMinutes`（默认 30）；
-6. **全局串行**：同一时刻最多一个 review 在跑（队列），新 turn/start 于该 session 出现则取消其排队任务（前台优先，对齐 Hermes 的 2 秒取消语义——dsh 侧排队任务直接丢弃即可，运行中的靠 AbortSignal）。
+6. **全局串行 + 前台取消**（并发逻辑，落地时最易写错，伪代码钉死）：
+
+   ```
+   perSession: Map<sessionId, { queuedTask?, controller? }>   // 每会话至多一条记录
+   running:    controller | null                              // 全局串行
+
+   turn/end(completed) → 达阈值：
+     若 running 为空 → 出队执行(sessionId)
+     否则 → 入队（覆盖该 session 旧的 queuedTask，每 session 至多排一个）
+   turn/start(sessionId)：
+     perSession.get(sessionId)?.controller?.abort()   // 取消运行中的该 session review
+     丢弃 perSession.get(sessionId)?.queuedTask        // 只动本 session，不碰其他会话
+   review 结束（完成/abort/超时）：
+     controller 从 perSession 摘除 → 出队下一个 queuedTask
+   ```
+
+   对齐 Hermes 的 2 秒取消语义——dsh 侧排队任务直接丢弃即可，运行中的靠 AbortSignal；
+7. **生命周期清理**：session/event 监听、review 队列、perSession map、每个在跑 review 的 AbortController 全部挂进 `ctx.effect()` 返回的清理函数（对齐 scheduled-items / skills-management 的做法），dispose 时 abort 全部在跑 review 并清空队列，防止热重载泄漏监听与后台 agent。
 
 成本核算：单次 review 输入 = 末尾 N 条消息（截断到 `maxTranscriptChars`，默认 ~12K 字符）+ skill 清单（几十条 × ≤500 字符）≈ 5-10K token；触发频率 = 每 10 turn 一次。比 Hermes 的全量重放（30K+）便宜。
 
@@ -100,7 +124,8 @@ skill writer
    - 命名纪律：class-level，禁止 PR 号/错误串/一次性代号；"名字只对今天的任务有意义就是错的"；
    - memory/skill 分工：流程进 skill；用户画像类本轮不沉淀（v1 不做 memory）。
 2. **既有 skill 清单**：`ctx.skills.snapshot()` 渲染为 `- name: description` 列表（这正是模型在会话里看到的同一份目录，判定"该 patch 谁"的依据）。
-3. **会话转写尾部**：`session.deriveMessages()` 末尾 N 条，超长按 `maxTranscriptChars` 截断（保尾不保头——结论和纠正通常在尾部）。
+3. **疑似相关 skill 全文**（patch 可行性的前提）：runner 从清单中按转写关键词/名称相似度匹配 top-N（默认 3）疑似相关 skill，读取其 SKILL.md 全文注入。patch 动作要求结论里的 `body` 基于目标正文修改，看不到全文就写不出正确的 patch——§2 架构图、本节、§6 守卫三处共享同一次读取（读取时同步计算 `baseHash` 供 writer 做 CAS，见 §6）。
+4. **会话转写尾部**：`session.deriveMessages()` 末尾 N 条，超长按 `maxTranscriptChars` 截断（保尾不保头——结论和纠正通常在尾部）。
 
 ### 输出协议（fenced JSON）
 
@@ -109,6 +134,8 @@ skill writer
   "skill": "kebab-case-name",          // create/patch 必填
   "description": "≤500 字符",           // create 必填
   "body": "完整 SKILL.md body（不含 frontmatter）",  // create/patch 必填
+  "baseHash": "sha256(注入时的目标 SKILL.md 全文)",  // patch 必填——CAS 用（§6），runner 注入 suspects 全文时同步计算并随 prompt 给出
+  "baseDescription": "注入时的目标 description 快照", // patch 必填——writer 校验 frontmatter 未被改过
   "rationale": "为什么值得/不值得存" }
 ```
 
@@ -127,7 +154,9 @@ skill writer
 
 > 收尾时若发现已加载的 skill 有错/缺步骤，直接用你的工具当场修正它，不要等后台复盘。
 
-这条的作用是让主 agent 具备 Hermes 的"in-session patch"能力（Hermes 的四级优先序第一条）。其余沉淀动作全部交给后台 loop，避免两套纪律打架。**若检测到 hermes-prompt 已安装，可跳过本 section**（其纪律宣言已覆盖），运行时经 `ctx.get` 探测即可。
+这条的作用是让主 agent 具备 Hermes 的"in-session patch"能力（Hermes 的四级优先序第一条）。其余沉淀动作全部交给后台 loop，避免两套纪律打架。
+
+**hermes-prompt 探测（已落地）**：hermes-prompt 原本只注册 `systemPrompt.section`、不暴露任何服务（systemPrompt 服务也没有"查询已注册 section"的 API，隐式探测不可行）。已在 hermes-prompt/src/index.js 的 apply 中补一行 `ctx.provide('hermesPrompt', { version })`（cordis 服务暴露必须用 `ctx.provide`——`ctx.set` 未先 provide 会抛错，vendor/cordis/src/reflect.ts:254-261）。hermes-loop 运行时经 `ctx.get('hermesPrompt', false)` 探测（strict 默认 true，未提供会抛错，必须显式传 false），取到即视为 hermes-prompt 已安装、跳过本 section；取不到则注册。
 
 ## 6. Skill 写入路径
 
@@ -135,9 +164,15 @@ skill writer
   - 全局经验 → `~/.dsh/skills/<name>/SKILL.md`（rank 400，与 skills-management installedDir 相同，两边都能看到对方的刷新）；
   - workspace 特有经验 → `<projectRoot>/.dsh/skills/<name>/SKILL.md`（rank 100，遮蔽用户级）——判定依据：转写中的 cwd / workspaceRegistry 归属；v1 先只写全局，v2 加项目级；
 - **写入格式**：目录 + SKILL.md；frontmatter `name`（kebab-case）+ `description`（非空，建议 ≤500 字符对齐目录渲染截断；Hermes 的 60 字符是它自家索引的限制，dsh 不适用）；body 章节规范 When to Use / Prerequisites / Procedure / Pitfalls / Verification（对齐 Hermes，同时喂给 dsh 的 skill 工具加载习惯）；
-- **read-before-write 守卫**：patch 动作要求 review 输入里包含目标 skill 的当前 body（runner 在构造 prompt 时读取并注入）；writer 校验结论里 `baseDescription`/内容指纹与所读版本一致，不一致（期间被改过）→ 拒绝并重排 review；
+- **read-before-write 守卫（两步，缺一不可）**：patch 动作要求 review 输入里包含目标 skill 的当前 body（runner 在构造 prompt 时读取并注入，同步计算 `baseHash`，见 §4 输入第 3 条）；
+  - **① CAS 比对**：writer 写入前**再读一次**目标文件，计算 sha256 与结论里的 `baseHash` 比对，不一致（review 期间被改过）→ 拒绝并重排 review；同时校验 `baseDescription` 与当前 frontmatter 一致。写入是插件进程内同步执行的，再读一次即可，无需文件锁；
+  - **② 原子写入**：临时文件 + 原子 rename，防并发读到半写入的文件（rename 不解决 ABA 覆盖问题，ABA 由①解决，见 §8.3）；
 - **防覆盖**：create 时目标已存在 → 降级为 nothing + 日志（避免静默覆盖用户手写的 skill；合并留给 v3 Curator）；
-- **approval 模式**：写入 `~/.dsh/hermes-loop/pending/<id>.json`（含拟写入的完整文件 + diff），v2 在 skills-management 客户端加待审列表；
+- **mode 行为**：
+  - `auto`：写入目标目录，即刻生效；
+  - `approval`：写入 pending 目录，等用户审批；
+  - `log-only`：**既不写 skill 目录也不写 pending**，review 结论 JSON 仅经 `ctx.logger.info` 输出——用于调试触发阈值与 prompt 质量，观察期默认值建议用它；
+- **approval 模式**：写入 pending 目录 `<pendingDir>/<id>.json`（含拟写入的完整文件 + diff），v2 在 skills-management 客户端加待审列表。**pendingDir 解析对齐 skills-management installedDir 的逻辑**（skills-management/src/index.js:516）：`process.env.DSH_HOME ? join(DSH_HOME, 'hermes-loop', 'pending') : join(homedir(), '.dsh', 'hermes-loop', 'pending')`——否则设了 `DSH_HOME` 的用户里 pending 与 skill 会落在两个不同的根下；
 - **可见性**：无需任何 invalidate 动作——chokidar watcher ~200ms 后自动失效 registry 缓存，下一 pre-step 重新 snapshot（实证 §1.6/§1.7）。**v1 的开放问题已解决**。唯一例外：watch 被关闭的环境才需要手动失效，运行时探测 `watch` 配置即可。
 
 ## 7. 范围与配置
@@ -149,7 +184,7 @@ skill writer
 ```yaml
 hermes-loop:
   enabled: true
-  mode: auto              # auto | approval | log-only
+  mode: auto              # auto（写入）| approval（进 pending）| log-only（仅日志，不落盘）
   provider: ""            # review agent 模型覆盖（"便宜模型"位），空=跟随默认
   model: ""
   turnInterval: 10        # 每 N 个 completed turn 触发一次
@@ -164,12 +199,12 @@ hermes-loop:
 
 1. **review agent 无工具的检索局限**：它只能看到注入的 skill 清单（name+description），看不到 skill 全文，patch 的内容可能与既有正文脱节。缓解：runner 在构造 prompt 时把"疑似相关 skill（名称/描述与转写关键词匹配）"的全文一并注入。v3 给 review agent 只读工具（`tools.restrict({ allow: ['skill'] })`，dsh 的 skill 工具正好是只读加载器）。
 2. **转写截断的偏差**：保尾截断可能丢掉早段的关键踩坑。缓解：阈值触发时窗口本来就是近 10 个 turn；`maxTranscriptChars` 可调；v2 可改为"每个 turn 存增量摘要，review 时拼接"。
-3. **多开 profile / 多 worker**：事件是进程内的，每个 dsh 进程各自跑 loop，写同一目录可能并发冲突。缓解：写入用临时文件+原子 rename；同 skill 冲突概率低（class-level 命名），v1 接受。
+3. **多开 profile / 多 worker**：事件是进程内的，每个 dsh 进程各自跑 loop，写同一目录可能并发冲突。**原子 rename 只能防"读到半写入的文件"，防不了两个进程读同一 skill → 各自修改 → 后写覆盖前写的 ABA 问题**——ABA 由 §6 守卫①（写入前重读文件比对 baseHash 的 CAS）解决，rename 负责半写读，两步配合才完整。同 skill 冲突概率低（class-level 命名），CAS 失败走重排 review，v1 接受。
 4. **dsh 版本耦合**：`session/event`、`tools.restrict`、watcher 行为都是当前 monorepo 的实现细节，升级需回归（在 README 标注已验证的 dsh 版本）。
 5. **skills-management 双 provider 重名仲裁**：它自己的 ntd-skills provider 与 harness 的 user-dsh root 扫同一目录，重名由 registry 按 rank+注册顺序仲裁（skill/src/index.ts:807-811）。hermes-loop 写入的 skill 会被两边同时看到——正常现象，但 UI 上可能出现双条目，v2 验证。
 
 ## 9. 分阶段实现计划（v2 修订）
 
-- **v0.1（最小闭环）**：`session/event` 订阅 + 阈值/冷却/排除逻辑 + review runner（agents.create + restrict + whenIdle + 事件泵，复用 skills-management 的 runShareInProcess 模式）+ JSON 结论解析 + auto 写入 `~/.dsh/skills` + read-before-write 守卫 + settings。验收：跑 10+ turn 的真实会话，确认 review 触发、skill 落盘、**下一个新会话的 available_skills 目录里出现该 skill**；
+- **v0.1（最小闭环）**：`session/event` 订阅 + 阈值/冷却/排除逻辑（含 perSession abort 链路，§3.6 伪代码）+ review runner（agents.create + restrict + whenIdle + 事件泵，复用 skills-management 的 runShareInProcess 模式）+ JSON 结论解析 + auto 写入 `~/.dsh/skills` + CAS 守卫（§6 两步）+ settings + ctx.effect 生命周期清理。验收：跑 10+ turn 的真实会话，确认 review 触发、skill 落盘、**下一个新会话的 available_skills 目录里出现该 skill**；
 - **v0.2（信任与体验）**：approval 模式 + pending 目录 + skills-management 客户端待审列表（注意 NO class component / NO createRoot）；order 51 的 in-session patch 纪律 section；项目级 skill 目录写入；review 结论回显到来源会话（`session.append('session/title', ...)` 或 plugin source followup，跑通后再定）；
 - **v0.3（防碎片化）**：疑似相关 skill 全文注入；Curator 定时 pass（stale 标记、归档不删除）；信号加速触发（失败率/纠正词表）。
