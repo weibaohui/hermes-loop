@@ -18,8 +18,9 @@ Hermes 能做到"每次对话完成后自动总结、形成 skill"，其机制�
 
 dsh 侧的现状：hermes-prompt 插件只注入了"收尾沉淀纪律"，靠模型自觉执行，无守卫、无审批、无防碎片化。hermes-loop 把这条纪律落成**具体可调用的端点 + 有守卫的写入管道**。
 
-## 设计要点（详见 design 文档）
+## 设计要点（v2，经平台源码实证，详见 design 文档）
 
-- 触发采用**主 agent 自报端点**方案：收尾纪律 prompt 指引主 agent 把对话 digest POST 到 `/hermes-loop/api/review`，插件起 headless review agent（`agentPreset: 'standard'`）产出结构化结论，由插件代码执行写入（read-before-write 与审批都是代码级守卫）；
-- review agent 只输出结论不落盘——比 Hermes 的工具运行时白名单更硬；
+- **触发与 Hermes 同构**：宿主插件 `ctx.on('session/event')` 订阅所有会话的 `turn/end`（completed），按阈值（默认每 10 turn）+ 冷却触发——不需要 prompt 自报，不需要平台改动；
+- **review agent 零工具**：`agents.create` + `tools.restrict({allow: []})`，输入 = 既有 skill 目录快照 + 会话转写尾部，输出 = 结构化 JSON 结论（nothing/create/patch），写入由插件代码执行（read-before-write 与审批都是代码级守卫）；
+- **写入即可见**：直接写 `~/.dsh/skills/`（全局）或 `<projectRoot>/.dsh/skills/`（workspace 级），chokidar watcher 自动失效 registry 缓存，下一会话的 available_skills 目录即出现；
 - 三阶段实现：v0.1 最小闭环 → v0.2 审批与客户端 UI → v0.3 Curator 防碎片化。
