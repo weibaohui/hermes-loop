@@ -5,6 +5,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createRequire } from 'node:module'
 
+// 测试全程把 DSH_HOME 指向临时目录：插件的 activity.jsonl 审计日志与全局
+// skill 目录都按 $DSH_HOME 解析，否则会污染真实 ~/.dsh。
+process.env.DSH_HOME = await mkdtemp(join(tmpdir(), 'hermes-loop-tests-'))
+
 const require = createRequire(import.meta.url)
 const plugin = require('../src/index.js')
 const {
@@ -164,10 +168,8 @@ function fakeServices(conclusionText) {
   }
   return {
     created,
-    services: {
-      agents: { create: async (opts) => { created.push(opts); return { agent, dispose: async () => {} } } },
-      agentDefaultModel: { currentSelection: () => ({ provider: 'prov', model: 'mdl' }) },
-    },
+    agents: { create: async (opts) => { created.push(opts); return { agent, dispose: async () => {} } } },
+    agentDefaultModel: { currentSelection: () => ({ provider: 'prov', model: 'mdl' }) },
   }
 }
 
@@ -180,8 +182,10 @@ function setupPlugin(config, services) {
     logger: { info: (m) => infos.push(String(m)), warn: (m) => warns.push(String(m)) },
     on: (name, fn) => { handlers.push(fn); return () => {} },
     effect: (fn) => { cleanups.push(fn()) },
-    inject: (deps, cb) => cb(deps.includes('agents') ? services : {}),
     skills: { snapshot: async () => ({ skills: [{ name: 'known-skill', description: 'a known skill about deploys', invocation: { modelInvocable: true } }], complete: true }) },
+    // 静态注入契约：服务直接挂在 ctx 上；settings 缺席时走 config+defaults 回退
+    settings: undefined,
+    ...services,
   }
   plugin.apply(ctx, config)
   return {
@@ -194,7 +198,7 @@ const completedTurn = { type: 'turn/end', data: { reason: { kind: 'completed' } 
 
 test('loop end-to-end: threshold fires review, log-only mode logs the conclusion', async () => {
   const conclusion = JSON.stringify({ action: 'nothing', rationale: 'one-off task' })
-  const { services } = fakeServices('```json\n' + conclusion + '\n```')
+  const services = fakeServices('```json\n' + conclusion + '\n```')
   const t = setupPlugin({ turnInterval: 2, cooldownMinutes: 0, mode: 'log-only' }, services)
   const session = { id: 'session-real', header: {}, deriveMessages: () => [{ role: 'user', content: 'hi' }] }
   t.fire(session, completedTurn)
@@ -210,7 +214,7 @@ test('loop end-to-end: auto mode lands the skill in $DSH_HOME/skills', async () 
   process.env.DSH_HOME = home
   try {
     const conclusion = JSON.stringify({ action: 'create', skill: 'e2e-skill', description: 'from e2e test', body: 'e2e body' })
-    const { services, created } = fakeServices('```json\n' + conclusion + '\n```')
+    const services = fakeServices('```json\n' + conclusion + '\n```')
     const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, services)
     const session = { id: 'session-e2e', header: { cwd: home }, deriveMessages: () => [{ role: 'user', content: 'do the thing' }] }
     t.fire(session, completedTurn)
@@ -219,7 +223,7 @@ test('loop end-to-end: auto mode lands the skill in $DSH_HOME/skills', async () 
     assert.match(written, /e2e body/)
     assert.match(written, /description: "from e2e test"/)
     // review agent was created zero-tool, standard preset, subagent origin, dedicated namespace
-    const createOpts = created.find((c) => c && c.sessionId)
+    const createOpts = services.created.find((c) => c && c.sessionId)
     assert.match(createOpts.sessionId, /^hermes-loop-review-/)
     assert.equal(createOpts.meta.origin, 'subagent')
     assert.equal(createOpts.meta.agentPreset, 'standard')
@@ -232,7 +236,7 @@ test('loop end-to-end: auto mode lands the skill in $DSH_HOME/skills', async () 
 })
 
 test('exclusions and gating: self/subagent/aborted never count, cooldown gates', async () => {
-  const { services } = fakeServices('```json\n{"action":"nothing"}\n```')
+  const services = fakeServices('```json\n{"action":"nothing"}\n```')
   let reviews = 0
   services.agents.create = async () => { reviews += 1; return { agent: fakeIdleAgent('{"action":"nothing"}'), dispose: async () => {} } }
   const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 60, mode: 'log-only' }, services)
@@ -252,7 +256,7 @@ test('exclusions and gating: self/subagent/aborted never count, cooldown gates',
 })
 
 test('tool/call window also triggers; disabled plugin stays silent', async () => {
-  const { services } = fakeServices('```json\n{"action":"nothing"}\n```')
+  const services = fakeServices('```json\n{"action":"nothing"}\n```')
   const t = setupPlugin({ turnInterval: 999, toolCallInterval: 3, cooldownMinutes: 0, mode: 'log-only' }, services)
   const session = { id: 'session-tools', header: {}, deriveMessages: () => [] }
   // tool 计数线与 Hermes 同构：计数随时累计，结算点仍在 turn 尾（不做 mid-turn 触发）
@@ -272,7 +276,7 @@ test('tool/call window also triggers; disabled plugin stays silent', async () =>
 })
 
 test('unparseable conclusions are dropped with a warn, not written', async () => {
-  const { services } = fakeServices('I think nothing is worth saving.')
+  const services = fakeServices('I think nothing is worth saving.')
   const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, services)
   const session = { id: 'session-junk', header: {}, deriveMessages: () => [] }
   t.fire(session, completedTurn)
