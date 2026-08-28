@@ -33,8 +33,11 @@ window.__ModuleLoader__.load({
         running: 'review 正在运行…',
         queued: '{n} 个 review 排队中',
         idle: '当前无 review',
-        written: '本插件沉淀的技能',
-        writtenEmpty: '还没有沉淀记录 —— 正常对话积累到阈值后会出现',
+        written: '沉淀的技能',
+        'written.tab.session': '本对话',
+        'written.tab.plugin': '本插件',
+        'written.sessionEmpty': '本对话还没有沉淀 —— 攒够触发阈值后，后台复盘的产物会出现在这里',
+        'written.pluginEmpty': '还没有任何沉淀记录',
         activity: '活动时间线',
         activityEmpty: '暂无活动',
         refresh: '刷新',
@@ -72,8 +75,11 @@ window.__ModuleLoader__.load({
         running: 'review running…',
         queued: '{n} review(s) queued',
         idle: 'no review in flight',
-        written: 'Skills distilled by this loop',
-        writtenEmpty: 'Nothing yet — accumulate turns to reach the threshold',
+        written: 'Distilled skills',
+        'written.tab.session': 'This session',
+        'written.tab.plugin': 'This plugin',
+        'written.sessionEmpty': 'Nothing from this conversation yet — reviews appear here once the threshold fires',
+        'written.pluginEmpty': 'No distilled skills yet',
         activity: 'Activity timeline',
         activityEmpty: 'No activity',
         refresh: 'Refresh',
@@ -155,6 +161,9 @@ window.__ModuleLoader__.load({
         var _f = React.useState(false)
         var flash = _f[0]
         var setFlash = _f[1]
+        var _w = React.useState('session')
+        var writtenTab = _w[0]
+        var setWrittenTab = _w[1]
 
         React.useEffect(function () {
           var alive = true
@@ -235,20 +244,36 @@ window.__ModuleLoader__.load({
             h('div', { className: 'hl-row hl-mut' },
               t('cooldown') + ': ' + (cooldownLeft > 0 ? t('cooldownWait', { s: cooldownLeft }) : t('cooldownReady')))),
 
-          // 沉淀产物
-          h('div', { className: 'hl-card' },
-            h('h3', null, t('written')),
-            data.written && data.written.length > 0
-              ? h('ul', { className: 'hl-list' }, data.written.map(function (w, i) {
-                return h('li', { key: i },
-                  h('span', { className: 'hl-tag' }, t('action.' + (w.action || 'create'))),
-                  h('span', { className: 'hl-skill' }, w.skill),
-                  h('span', { className: 'hl-mut' }, fmtTime(w.at)),
-                  w.result && w.result !== 'created' && w.result !== 'patched'
-                    ? h('span', { className: 'hl-err hl-mut' }, w.result) : null,
-                  w.path ? h('span', { className: 'hl-path' }, w.path) : null)
-              }))
-              : h('div', { className: 'hl-mut' }, t('writtenEmpty'))),
+          // 沉淀产物：本对话（默认）/ 本插件 两个子 tab
+          (function () {
+            var all = data.written || []
+            var rows = writtenTab === 'session'
+              ? all.filter(function (w) { return w.sessionId && w.sessionId === sessionId })
+              : all
+            var emptyText = writtenTab === 'session' ? t('written.sessionEmpty') : t('written.pluginEmpty')
+            return h('div', { className: 'hl-card' },
+              h('h3', null, t('written')),
+              h('div', { className: 'hl-row', style: { marginBottom: '6px' } },
+                ['session', 'plugin'].map(function (tabKey) {
+                  return h('button', {
+                    key: tabKey,
+                    className: 'hl-chip' + (writtenTab === tabKey ? ' on' : ''),
+                    onClick: function () { setWrittenTab(tabKey) },
+                  }, t('written.tab.' + tabKey))
+                }),
+              h('span', { className: 'hl-mut hl-num' }, rows.length)),
+              rows.length > 0
+                ? h('ul', { className: 'hl-list' }, rows.map(function (w, i) {
+                  return h('li', { key: i },
+                    h('span', { className: 'hl-tag' }, t('action.' + (w.action || 'create'))),
+                    h('span', { className: 'hl-skill' }, w.skill),
+                    h('span', { className: 'hl-mut' }, fmtTime(w.at)),
+                    w.result && w.result !== 'created' && w.result !== 'patched'
+                      ? h('span', { className: 'hl-err hl-mut' }, w.result) : null,
+                    w.path ? h('span', { className: 'hl-path' }, w.path) : null)
+                }))
+                : h('div', { className: 'hl-mut' }, emptyText))
+          })(),
 
           // 活动时间线
           h('div', { className: 'hl-card' },

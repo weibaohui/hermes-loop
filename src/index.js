@@ -513,12 +513,12 @@ module.exports = {
         const payload = { id, at: new Date().toISOString(), sourceSession: sessionId, mode: eff.mode, globalDir: globalSkillsDir(), conclusion }
         await fsP.mkdir(dir, { recursive: true })
         await atomicWrite(join(dir, `${id}.json`), JSON.stringify(payload, null, 2))
-        trace('staged', { id, dir })
+        trace('staged', { id, dir, sessionId })
         ctx.logger.info(`${logHead} — staged to ${dir} for approval`)
         return
       }
       const outcome = await applyConclusion(conclusion, { globalDir: globalSkillsDir() })
-      trace('write-outcome', { skill: conclusion.skill, ...outcome })
+      trace('write-outcome', { sessionId, skill: conclusion.skill, ...outcome })
       if (outcome.result === 'created' || outcome.result === 'patched') {
         ctx.logger.info(`${logHead} — ${outcome.result} → ${outcome.path}`)
       } else {
@@ -613,6 +613,11 @@ module.exports = {
         sessions[sid] = { turns: st.turns, toolCalls: st.toolCalls, lastReviewAt: st.lastReviewAt || undefined }
       }
       const activity = await readActivityTail()
+      // 回填 sessionId：write-outcome 本身不带，从同 skill 最近的 dispatch 事件取
+      const dispatchSessionBySkill = new Map()
+      for (const e of activity) {
+        if (e.event === 'dispatch' && e.skill && e.sessionId) dispatchSessionBySkill.set(e.skill, e.sessionId)
+      }
       const written = activity
         .filter((e) => (e.event === 'write-outcome' && e.result) || e.event === 'staged')
         .map((e) => ({
@@ -621,6 +626,7 @@ module.exports = {
           skill: e.skill,
           result: e.event === 'staged' ? 'staged' : e.result,
           path: e.path,
+          sessionId: e.sessionId || dispatchSessionBySkill.get(e.skill),
         }))
         .reverse()
       const current = sessionId !== undefined && sessionId !== '' ? sessions[sessionId] : undefined
