@@ -20,7 +20,8 @@ const { join, resolve, sep } = require('node:path')
 const { homedir } = require('node:os')
 // settings 服务要求 schemastery schema（需要可调用校验 + toJSON，zod 不兼容）
 let Schema = null
-try { Schema = require('@deepseek-ai/schemastery') } catch { Schema = null }
+let schemaRequireError = null
+try { Schema = require('@deepseek-ai/schemastery') } catch (e) { Schema = null; schemaRequireError = String(e && e.code || e) }
 
 const KEbab_NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 const DESCRIPTION_MAX = 500
@@ -355,7 +356,7 @@ module.exports = {
         ctx.logger.warn(`hermes-loop: settings register: ${e && e.message}`)
       }
     } else {
-      trace('settings-register-skipped', { schema: Boolean(schema), settingsType: typeof ctx.settings })
+      trace('settings-register-skipped', { schema: Boolean(schema), schemaRequireError, settingsType: typeof ctx.settings })
     }
 
     const effective = () => {
