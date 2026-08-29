@@ -342,7 +342,7 @@ module.exports = {
 
   apply(ctx, config = {}) {
     const trace = makeTracer()
-    trace('armed', { pid: process.pid, config: { ...DEFAULTS, ...config } })
+    trace('armed', { pid: process.pid, config: { ...DEFAULTS, ...config }, probes: { settings: typeof ctx.settings, register: ctx.settings && typeof ctx.settings.register, systemPrompt: typeof ctx.systemPrompt, get: typeof ctx.get, inject: typeof ctx.inject } })
     let settingsScope = null
     const schema = settingsSchema()
     if (schema && ctx.settings && typeof ctx.settings.register === 'function') {
