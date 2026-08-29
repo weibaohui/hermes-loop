@@ -482,3 +482,66 @@ test('POST review-now starts a review for a live session, bypassing thresholds',
   assert.equal(during.body.state, 'already-running')
   release()
 })
+
+// ── skill usage statistics ─────────────────────────────────────────────
+
+test('usage stats: skill tool/call counts, catalog exposure, persisted and exposed', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-usage-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const services = fakeServices('```json\n{"action":"nothing"}\n```')
+    const t = setupPlugin({ turnInterval: 999, mode: 'log-only' }, services)
+    await new Promise((r) => setTimeout(r, 30))
+    const route = t.routes[0]
+    const session = { id: 'session-usage', header: {}, deriveMessages: () => [] }
+    // 模型调用 skill 工具两次（mac-a）+ 一次（mac-b）
+    t.fire(session, { type: 'tool/call', data: { name: 'skill', callId: 'c1', arguments: JSON.stringify({ name: 'mac-a' }) } })
+    t.fire(session, { type: 'tool/call', data: { name: 'skill', callId: 'c2', arguments: JSON.stringify({ name: 'mac-a' }) } })
+    t.fire(session, { type: 'tool/call', data: { name: 'skill', callId: 'c3', arguments: JSON.stringify({ name: 'mac-b' }) } })
+    t.fire(session, { type: 'tool/call', data: { name: 'bash', callId: 'c4', arguments: '{}' } }) // 非 skill 工具不计数
+    // 目录曝光（skill-catalog 注入）
+    t.fire(session, { type: 'user/message', data: { content: [{ type: 'text', text: 'catalog' }], source: { kind: 'skill-catalog', form: 'catalog', entries: [{ name: 'mac-a' }, { name: 'ghost-skill' }] } } })
+    // 防抖冲洗
+    await new Promise((r) => setTimeout(r, 5600))
+    const res = { statusCode: null, body: null, writeHead(s) { this.statusCode = s }, end(b) { this.body = b } }
+    await route.handler({ method: 'GET', url: '/hermes-loop/api/status?sessionId=session-usage' }, res)
+    const body = JSON.parse(res.body)
+    if (body.usage.totalCalls !== 3) console.log('DEBUG usage:', JSON.stringify(body.usage), 'warns:', t.warns, 'routes:', t.routes.length)
+    assert.equal(body.usage.totalCalls, 3)
+    assert.equal(body.usage.rows.find((r) => r.skill === 'mac-a').count, 2)
+    assert.ok(body.usage.rows.find((r) => r.skill === 'mac-a').lastUsedAt)
+    assert.equal(body.usage.rows.find((r) => r.skill === 'ghost-skill').count, 0) // 只曝光未调用
+    assert.equal(body.usage.neverCalled, 1)
+    assert.equal(body.usage.catalogEntries, 2)
+    // 持久化文件
+    const saved = JSON.parse(await readFile(join(home, 'hermes-loop', 'usage.json'), 'utf8'))
+    assert.equal(saved.usage['mac-a'].count, 2)
+    assert.equal(saved.catalog['ghost-skill'].count, 1)
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('usage stats survive a restart (loaded from usage.json)', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-usage2-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    await mkdir(join(home, 'hermes-loop'), { recursive: true })
+    await writeFile(join(home, 'hermes-loop', 'usage.json'), JSON.stringify({ savedAt: 'x', usage: { 'old-skill': { count: 7, lastUsedAt: '2026-08-01T00:00:00.000Z', lastSessionId: 's1' } }, catalog: {} }))
+    const services = fakeServices('```json\n{"action":"nothing"}\n```')
+    const t = setupPlugin({ turnInterval: 999, mode: 'log-only' }, services)
+    await new Promise((r) => setTimeout(r, 30))
+    const res = { statusCode: null, body: null, writeHead(s) { this.statusCode = s }, end(b) { this.body = b } }
+    await t.routes[0].handler({ method: 'GET', url: '/hermes-loop/api/status?sessionId=' }, res)
+    const row = JSON.parse(res.body).usage.rows.find((r) => r.skill === 'old-skill')
+    assert.equal(row.count, 7)
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})

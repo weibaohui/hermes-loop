@@ -34,6 +34,11 @@ window.__ModuleLoader__.load({
         queued: '{n} 个 review 排队中',
         idle: '当前无 review',
         written: '沉淀的技能',
+        usage: '技能使用统计',
+        'usage.calls': '调用',
+        'usage.last': '最近使用',
+        'usage.summary': '总调用 {n} 次 · 目录曝光 {c} 条 · 其中 {z} 条从未被调用',
+        'usage.empty': '还没有技能调用记录 —— 模型通过 skill 工具加载技能时会在这里计数',
         'written.tab.session': '本对话',
         'written.tab.plugin': '本插件',
         'written.sessionEmpty': '本对话还没有沉淀 —— 攒够触发阈值后，后台复盘的产物会出现在这里',
@@ -70,6 +75,11 @@ window.__ModuleLoader__.load({
         queued: '{n} review(s) queued',
         idle: 'no review in flight',
         written: 'Distilled skills',
+        usage: 'Skill usage stats',
+        'usage.calls': 'calls',
+        'usage.last': 'last used',
+        'usage.summary': '{n} calls total · {c} catalog entries · {z} never invoked',
+        'usage.empty': 'No usage yet — counts land here when the model loads a skill',
         'written.tab.session': 'This session',
         'written.tab.plugin': 'This plugin',
         'written.sessionEmpty': 'Nothing from this conversation yet — reviews appear here once the threshold fires',
@@ -114,6 +124,10 @@ window.__ModuleLoader__.load({
       '.hl-tag{font-size:11px;border-radius:4px;padding:1px 6px;background:var(--dsw-alias-bg-layer-3,rgba(128,128,128,.2))}',
       '.hl-err{color:var(--dsw-alias-state-negative,#c75050)}',
       '.hl-mut{opacity:.55}',
+      '.hl-table{width:100%;border-collapse:collapse;font-size:12px}',
+      '.hl-table th{opacity:.55;text-align:left;font-weight:500;padding:2px 8px 4px 0}',
+      '.hl-table td{padding:3px 8px 3px 0;border-top:1px solid var(--dsw-alias-border-l3,rgba(128,128,128,.15));font-variant-numeric:tabular-nums}',
+      '.hl-scroll{max-height:260px;overflow:auto}',
     ].join('')
 
     var fmtTime = function (iso) {
@@ -284,6 +298,29 @@ window.__ModuleLoader__.load({
                     w.path ? h('span', { className: 'hl-path' }, w.path) : null)
                 }))
                 : h('div', { className: 'hl-mut' }, emptyText))
+          })(),
+
+          // 技能使用统计（模型经 skill 工具的真实调用 + 目录曝光）
+          (function () {
+            var u = data.usage || { rows: [], totalCalls: 0, catalogEntries: 0, neverCalled: 0 }
+            return h('div', { className: 'hl-card' },
+              h('h3', null, t('usage')),
+              u.rows.length > 0
+                ? h('div', null,
+                  h('div', { className: 'hl-row hl-mut' }, t('usage.summary', { n: u.totalCalls, c: u.catalogEntries, z: u.neverCalled })),
+                  h('div', { className: 'hl-scroll' },
+                    h('table', { className: 'hl-table' },
+                      h('thead', null, h('tr', null,
+                        h('th', null, t('tab')),
+                        h('th', null, t('usage.calls')),
+                        h('th', null, t('usage.last')))),
+                      h('tbody', null, u.rows.map(function (row, i) {
+                        return h('tr', { key: i },
+                          h('td', { className: 'hl-skill' }, row.skill),
+                          h('td', null, row.count > 0 ? row.count : h('span', { className: 'hl-mut' }, '—')),
+                          h('td', { className: 'hl-mut' }, row.lastUsedAt ? fmtTime(row.lastUsedAt) : '—'))
+                      })))))
+                : h('div', { className: 'hl-mut' }, t('usage.empty')))
           })(),
         )
       }

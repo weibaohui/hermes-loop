@@ -419,6 +419,28 @@ module.exports = {
 
     const activityFile = () => join(dshHome(), 'hermes-loop', 'activity.jsonl')
 
+    // ── 技能使用统计（Curator stale 判定的地基）──
+    // usage: 模型经 skill 工具的真实调用；catalogSeen: 出现在目录消息里的曝光。
+    // "曝光多次但调用为零" 即僵尸候选。持久化到 usage.json（防抖 5s + dispose 冲洗）。
+    const usageFile = () => join(dshHome(), 'hermes-loop', 'usage.json')
+    const usage = new Map()
+    const catalogSeen = new Map()
+    let usageFlushTimer = null
+    fsP.readFile(usageFile(), 'utf8').then((raw) => {
+      const parsed = JSON.parse(raw)
+      for (const [name, u] of Object.entries(parsed.usage || {})) usage.set(name, u)
+      for (const [name, c] of Object.entries(parsed.catalog || {})) catalogSeen.set(name, c)
+    }).catch(() => {})
+    const flushUsage = () => {
+      const payload = JSON.stringify({ savedAt: new Date().toISOString(), usage: Object.fromEntries(usage), catalog: Object.fromEntries(catalogSeen) }, null, 2)
+      atomicWrite(usageFile(), payload).catch(() => {})
+    }
+    const scheduleUsageFlush = () => {
+      if (usageFlushTimer !== null) return
+      usageFlushTimer = setTimeout(() => { usageFlushTimer = null; flushUsage() }, 5000)
+      if (typeof usageFlushTimer.unref === 'function') usageFlushTimer.unref()
+    }
+
     const stateFor = (sessionId) => {
       let st = windows.get(sessionId)
       if (st === undefined) windows.set(sessionId, st = { turns: 0, toolCalls: 0, lastReviewAt: 0 })
@@ -627,7 +649,36 @@ module.exports = {
           if (running !== null && running.sessionId === sessionId) running.controller.abort()
           return
         }
-        if (event.type === 'tool/call') { stateFor(sessionId).toolCalls += 1; return } // 随时累计，结算点在 turn 尾（与 Hermes turn_finalizer 同构）
+        if (event.type === 'tool/call') {
+          stateFor(sessionId).toolCalls += 1 // 随时累计，结算点在 turn 尾（与 Hermes turn_finalizer 同构）
+          // 技能调用统计：tool/call 的 arguments 里带技能名（apiproxy 同款解析）
+          if (event.data && event.data.name === 'skill') {
+            try {
+              const args = JSON.parse(event.data.arguments || '{}')
+              if (typeof args.name === 'string' && args.name !== '') {
+                const u = usage.get(args.name) || { count: 0, lastUsedAt: undefined, lastSessionId: undefined }
+                u.count += 1
+                u.lastUsedAt = new Date().toISOString()
+                u.lastSessionId = sessionId
+                usage.set(args.name, u)
+                scheduleUsageFlush()
+              }
+            } catch { /* arguments 非 JSON：跳过计数 */ }
+          }
+          return
+        }
+        // 目录曝光统计：skill-catalog 注入消息带本次发布的全部条目
+        if (event.type === 'user/message' && event.data && event.data.source && event.data.source.kind === 'skill-catalog' && Array.isArray(event.data.source.entries)) {
+          for (const entry of event.data.source.entries) {
+            if (!entry || typeof entry.name !== 'string') continue
+            const c = catalogSeen.get(entry.name) || { count: 0, lastAt: undefined }
+            c.count += 1
+            c.lastAt = new Date().toISOString()
+            catalogSeen.set(entry.name, c)
+          }
+          scheduleUsageFlush()
+          return
+        }
         if (event.type !== 'turn/end') return
         if (reasonKind(event.data && event.data.reason) !== 'completed') return
 
@@ -656,6 +707,8 @@ module.exports = {
         try { dispose() } catch {}
         queued.clear()
         windows.clear()
+        if (usageFlushTimer !== null) { clearTimeout(usageFlushTimer); usageFlushTimer = null }
+        if (usage.size > 0 || catalogSeen.size > 0) flushUsage() // 统计不丢
         if (running !== null) running.controller.abort() // runner finally 里 dispose agent
       }
     }, 'hermes-loop: session/event subscription')
@@ -748,6 +801,18 @@ module.exports = {
         }
       }
       const current = sessionId !== undefined && sessionId !== '' ? sessions[sessionId] : undefined
+      const usageRows = [...usage.entries()]
+        .map(([skill, u]) => ({ skill, count: u.count, lastUsedAt: u.lastUsedAt, lastSessionId: u.lastSessionId }))
+        .sort((a, b) => b.count - a.count)
+      for (const [name] of catalogSeen) {
+        if (!usage.has(name)) usageRows.push({ skill: name, count: 0, lastUsedAt: undefined, lastSessionId: undefined })
+      }
+      const usageStats = {
+        totalCalls: usageRows.reduce((sum, r) => sum + r.count, 0),
+        catalogEntries: catalogSeen.size,
+        neverCalled: usageRows.filter((r) => r.count === 0).length,
+        rows: usageRows.slice(0, 50),
+      }
       return {
         settings: eff,
         running: running !== null ? { sessionId: running.sessionId, startedAt: runningSince, preview: running.preview } : null,
@@ -757,6 +822,7 @@ module.exports = {
         activity,
         reviews: reviews.reverse(),
         written,
+        usage: usageStats,
       }
     }
 
