@@ -37,6 +37,9 @@ window.__ModuleLoader__.load({
         usage: '技能使用统计',
         'usage.calls': '调用',
         'usage.last': '最近使用',
+        'usage.status': '状态',
+        'usage.modelVisible': '模型可见',
+        'usage.modelDisabled': '已降级',
         'usage.summary': '总调用 {n} 次 · 目录曝光 {c} 条 · 其中 {z} 条从未被调用',
         'usage.empty': '还没有技能调用记录 —— 模型通过 skill 工具加载技能时会在这里计数',
         'written.tab.session': '本对话',
@@ -78,6 +81,9 @@ window.__ModuleLoader__.load({
         usage: 'Skill usage stats',
         'usage.calls': 'calls',
         'usage.last': 'last used',
+        'usage.status': 'status',
+        'usage.modelVisible': 'model-visible',
+        'usage.modelDisabled': 'demoted',
         'usage.summary': '{n} calls total · {c} catalog entries · {z} never invoked',
         'usage.empty': 'No usage yet — counts land here when the model loads a skill',
         'written.tab.session': 'This session',
@@ -313,12 +319,16 @@ window.__ModuleLoader__.load({
                       h('thead', null, h('tr', null,
                         h('th', null, t('tab')),
                         h('th', null, t('usage.calls')),
-                        h('th', null, t('usage.last')))),
+                        h('th', null, t('usage.last')),
+                        h('th', null, t('usage.status')))),
                       h('tbody', null, u.rows.map(function (row, i) {
-                        return h('tr', { key: i },
+                        var zombie = row.count === 0
+                        var statusText = row.modelInvocable === undefined ? '—' : (row.modelInvocable ? t('usage.modelVisible') : t('usage.modelDisabled'))
+                        return h('tr', { key: i, style: zombie ? { opacity: .6 } : null },
                           h('td', { className: 'hl-skill' }, row.skill),
-                          h('td', null, row.count > 0 ? row.count : h('span', { className: 'hl-mut' }, '—')),
-                          h('td', { className: 'hl-mut' }, row.lastUsedAt ? fmtTime(row.lastUsedAt) : '—'))
+                          h('td', null, zombie ? h('span', { className: 'hl-mut' }, '—') : row.count),
+                          h('td', { className: 'hl-mut' }, row.lastUsedAt ? fmtTime(row.lastUsedAt) : '—'),
+                          h('td', null, h('span', { className: 'hl-tag' + (row.modelInvocable === false ? ' hl-err' : '') }, statusText)))
                       })))))
                 : h('div', { className: 'hl-mut' }, t('usage.empty')))
           })(),

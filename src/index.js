@@ -232,6 +232,25 @@ function buildSkillMd(name, description, body) {
 }
 
 /**
+ * Patch 版 frontmatter：更新 name/description 与 body，其余键原样保留。
+ * `disable-model-invocation` / `user-invocable`（dsh 原生键，docs/subsystems/skills.md）
+ * 是用户/平台的治理标记——复盘重写绝不能抹掉它们。
+ */
+function mergeFrontmatter(existingContent, name, description, newBody) {
+  const raw = String(existingContent || '')
+  const lines = raw.split(/\r?\n/)
+  if (lines[0] === undefined || lines[0].trim() !== '---') return buildSkillMd(name, description, newBody)
+  let closer = -1
+  for (let i = 1; i < lines.length; i += 1) {
+    if (lines[i].trim() === '---') { closer = i; break }
+  }
+  if (closer === -1) return buildSkillMd(name, description, newBody)
+  const kept = lines.slice(1, closer).filter((l) => !/^(name|description)\s*:/.test(l.trim()))
+  const yaml = [`name: ${JSON.stringify(name)}`, `description: ${JSON.stringify(description.replace(/\r?\n/g, ' '))}`, ...kept].join('\n')
+  return `---\n${yaml}\n---\n\n${newBody.replace(/\s+$/, '')}\n`
+}
+
+/**
  * Validate and apply a conclusion to the filesystem.
  * Guards, in order: create-onto-existing downgrade; patch CAS re-read;
  * atomic temp-file rename. Never writes outside `globalDir`.
@@ -271,7 +290,7 @@ async function applyConclusion(conclusion, { globalDir, now = new Date().toISOSt
   const description = conclusion.baseDescription !== undefined && conclusion.baseDescription !== ''
     ? conclusion.baseDescription
     : descriptionOf(current) || ''
-  const content = buildSkillMd(conclusion.skill, description, conclusion.body)
+  const content = mergeFrontmatter(current, conclusion.skill, description, conclusion.body)
   await atomicWrite(targetFile, content)
   return { result: 'patched', path: targetFile, at: now }
 }
@@ -352,7 +371,7 @@ module.exports = {
   inject: ['skills', 'settings', 'agents', 'agentDefaultModel', 'systemPrompt', 'sessions'],
   __internals: {
     reasonKind, contentToText, renderTranscript, tokenize, rankSuspects,
-    extractFencedJson, parseConclusion, sha256, buildSkillMd, applyConclusion,
+    extractFencedJson, parseConclusion, sha256, buildSkillMd, mergeFrontmatter, applyConclusion,
     descriptionOf, atomicWrite, DEFAULTS, dshHome, globalSkillsDir, pendingDir,
   },
 
@@ -801,11 +820,20 @@ module.exports = {
         }
       }
       const current = sessionId !== undefined && sessionId !== '' ? sessions[sessionId] : undefined
+      // 目录快照提供每个技能当前的 modelInvocable（frontmatter 治理键的实时状态）
+      let invocableByName = null
+      try {
+        const snapshot = await ctx.skills.snapshot({})
+        invocableByName = new Map((snapshot.skills || []).map((s) => [s.name, !(s.invocation && s.invocation.modelInvocable === false)]))
+      } catch { /* snapshot 失败：状态列留空 */ }
       const usageRows = [...usage.entries()]
         .map(([skill, u]) => ({ skill, count: u.count, lastUsedAt: u.lastUsedAt, lastSessionId: u.lastSessionId }))
         .sort((a, b) => b.count - a.count)
       for (const [name] of catalogSeen) {
         if (!usage.has(name)) usageRows.push({ skill: name, count: 0, lastUsedAt: undefined, lastSessionId: undefined })
+      }
+      if (invocableByName !== null) {
+        for (const row of usageRows) row.modelInvocable = invocableByName.get(row.skill)
       }
       const usageStats = {
         totalCalls: usageRows.reduce((sum, r) => sum + r.count, 0),

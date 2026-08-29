@@ -13,7 +13,7 @@ const require = createRequire(import.meta.url)
 const plugin = require('../src/index.js')
 const {
   reasonKind, contentToText, renderTranscript, rankSuspects, parseConclusion,
-  sha256, buildSkillMd, applyConclusion, descriptionOf, DEFAULTS,
+  sha256, buildSkillMd, mergeFrontmatter, applyConclusion, descriptionOf, DEFAULTS,
 } = plugin.__internals
 
 // ── reasonKind ──────────────────────────────────────────────────────────
@@ -544,4 +544,26 @@ test('usage stats survive a restart (loaded from usage.json)', async () => {
     else process.env.DSH_HOME = oldHome
     await rm(home, { recursive: true, force: true })
   }
+})
+
+test('mergeFrontmatter preserves governance keys (disable-model-invocation etc.) on patch', async () => {
+  const dir = await tempGlobalDir()
+  try {
+    await mkdir(join(dir, 'governed'), { recursive: true })
+    const original = '---\nname: "governed"\ndescription: "orig"\ndisable-model-invocation: true\nversion: "1.2"\n---\n\nbody v1\n'
+    await writeFile(join(dir, 'governed', 'SKILL.md'), original)
+    const ok = await applyConclusion(
+      { action: 'patch', skill: 'governed', body: 'body v2', baseHash: sha256(original), baseDescription: 'orig' },
+      { globalDir: dir })
+    assert.equal(ok.result, 'patched')
+    const after = await readFile(join(dir, 'governed', 'SKILL.md'), 'utf8')
+    assert.match(after, /disable-model-invocation: true/)
+    assert.match(after, /version: "1\.2"/)
+    assert.match(after, /body v2/)
+    assert.equal(descriptionOf(after), 'orig')
+    // 纯函数：无 frontmatter 的内容回退为新建
+    const fresh = mergeFrontmatter('plain body', 'x', 'd', 'nb')
+    assert.match(fresh, /nb/)
+    assert.match(fresh, /^---\nname: "x"/)
+  } finally { await rm(dir, { recursive: true, force: true }) }
 })
