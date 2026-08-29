@@ -439,3 +439,46 @@ test('write outcomes echo a plugin-notice user/message into the source session',
     await rm(home, { recursive: true, force: true })
   }
 })
+
+// ── manual review-now route ────────────────────────────────────────────
+
+test('POST review-now starts a review for a live session, bypassing thresholds', async () => {
+  const services = fakeServices('```json\n{"action":"nothing","rationale":"manual check"}\n```')
+  const live = { id: 'session-manual', header: {}, deriveMessages: () => [] }
+  const t = setupPlugin({ turnInterval: 999, cooldownMinutes: 999, mode: 'log-only' }, {
+    ...services,
+    sessions: { get: (sid) => sid === 'session-manual' ? live : undefined },
+  })
+  await new Promise((r) => setTimeout(r, 30))
+  const route = t.routes[0]
+  const post = (body) => new Promise((fulfil) => {
+    const res = { statusCode: null, body: null, writeHead(s) { this.statusCode = s }, end(b) { this.body = b } }
+    const req = new (require('node:events').EventEmitter)()
+    req.method = 'POST'; req.url = '/hermes-loop/api/review-now'
+    process.nextTick(() => { req.emit('data', Buffer.from(JSON.stringify(body))); req.emit('end') })
+    route.handler(req, res).then(() => fulfil({ status: res.statusCode, body: JSON.parse(res.body) }))
+  })
+  // 未知会话 → 404
+  const missing = await post({ sessionId: 'session-ghost' })
+  assert.equal(missing.status, 404)
+  // 空 sessionId → 400
+  const empty = await post({})
+  assert.equal(empty.status, 400)
+  // 正常触发：阈值远未达到也能立即复盘
+  const ok = await post({ sessionId: 'session-manual' })
+  assert.equal(ok.status, 202)
+  assert.equal(ok.body.state, 'started')
+  await new Promise((r) => setTimeout(r, 100))
+  if (!t.infos.some((m) => m.includes('→ nothing'))) console.log('DEBUG infos:', t.infos, 'warns:', t.warns)
+  assert.ok(t.infos.some((m) => m.includes('→ nothing')), 'manual review ran and concluded')
+  // review 会话运行中重复点 → already-running（用阻塞 agent 模拟）
+  let release
+  const gate = new Promise((r) => { release = r })
+  services.agents.create = async () => ({ agent: { ...fakeIdleAgent('{"action":"nothing"}'), whenIdle: () => gate }, dispose: async () => {} })
+  const again = await post({ sessionId: 'session-manual' })
+  assert.equal(again.body.state, 'started')
+  await new Promise((r) => setTimeout(r, 30))
+  const during = await post({ sessionId: 'session-manual' })
+  assert.equal(during.body.state, 'already-running')
+  release()
+})

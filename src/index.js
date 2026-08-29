@@ -349,7 +349,7 @@ module.exports = {
   // 静态注入：apply 在这些服务就绪后才运行（at-file 同款模式）。
   // 动态 ctx.inject(['settings'], cb) 在 apply 内不会触发——skills-management 的
   // settings 注册就是这么静默失效的（平台 gotcha）。
-  inject: ['skills', 'settings', 'agents', 'agentDefaultModel', 'systemPrompt'],
+  inject: ['skills', 'settings', 'agents', 'agentDefaultModel', 'systemPrompt', 'sessions'],
   __internals: {
     reasonKind, contentToText, renderTranscript, tokenize, rankSuspects,
     extractFencedJson, parseConclusion, sha256, buildSkillMd, applyConclusion,
@@ -432,7 +432,7 @@ module.exports = {
       Promise.resolve().then(task).catch((e) => ctx.logger.warn(`hermes-loop: review task: ${e && e.message}`))
     }
 
-    const runReview = async ({ session, eff }) => {
+    const runReview = async ({ session, eff, manual = false }) => {
       const sessionId = session.id
       const controller = new AbortController()
       const st = stateFor(sessionId)
@@ -442,7 +442,7 @@ module.exports = {
       st.lastReviewAt = Date.now()
       running = { sessionId, controller }
       runningSince = new Date().toISOString()
-      trace('review-start', { sessionId })
+      trace('review-start', { sessionId, manual })
 
       let handle
       try {
@@ -491,12 +491,16 @@ module.exports = {
         // 4. pump the final assistant message out of the session log
         const firstSeq = agent.session.seq
         let finalText = ''
+        let liveText = ''
         const pump = () => {
           for (const ev of agent.session.events) {
             if (ev.seq < firstSeq) continue
             if (ev.type === 'assistant/message' && ev.data && ev.data.message) {
               const text = contentToText(ev.data.message.content)
               if (text.trim() !== '') finalText = text
+            } else if (ev.type === 'assistant/chunk' && ev.data && ev.data.chunk && ev.data.chunk.type === 'text' && ev.data.chunk.text) {
+              liveText += ev.data.chunk.text
+              if (running !== null && running.sessionId === sessionId) running.preview = liveText.slice(-1200)
             }
           }
         }
@@ -771,6 +775,29 @@ module.exports = {
                 if (settingsScope && typeof settingsScope.update === 'function') await settingsScope.update(body.patch)
                 else Object.assign(config, body.patch) // 无 settings 服务时退化为运行时覆盖
                 sendJson(res, 200, { ok: true, settings: effective() })
+                return
+              }
+              // 手动"立即复盘"：绕过阈值/冷却，但仍走全局串行队列与前台取消
+              if (req.method === 'POST' && apiPath.endsWith('/hermes-loop/api/review-now')) {
+                const body = await readJsonBody(req)
+                const sessionId = body && typeof body.sessionId === 'string' ? body.sessionId : ''
+                if (sessionId === '') { sendJson(res, 400, { error: 'body must provide sessionId' }); return }
+                if (typeof ctx.sessions.get !== 'function') { sendJson(res, 503, { error: 'sessions service unavailable' }); return }
+                const session = ctx.sessions.get(sessionId)
+                if (session === undefined) { sendJson(res, 404, { error: `session '${sessionId}' is not live in this process` }); return }
+                if (sessionId.startsWith('hermes-loop-review-')) { sendJson(res, 400, { error: 'cannot review a review session' }); return }
+                if (running !== null && running.sessionId === sessionId) {
+                  sendJson(res, 200, { ok: true, state: 'already-running' })
+                  return
+                }
+                const task = () => runReview({ session, eff: effective(), manual: true })
+                if (running === null) {
+                  Promise.resolve().then(task).catch((e) => ctx.logger.warn(`hermes-loop: manual review: ${e && e.message}`))
+                } else {
+                  queued.set(sessionId, task) // 排队（顶替同 session 旧任务），running 结束后 drainNext
+                }
+                trace('manual-review-requested', { sessionId, queued: running !== null })
+                sendJson(res, 202, { ok: true, state: running !== null ? 'queued' : 'started' })
                 return
               }
               sendJson(res, 404, { error: 'not found' })

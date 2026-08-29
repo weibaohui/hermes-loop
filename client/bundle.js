@@ -41,6 +41,10 @@ window.__ModuleLoader__.load({
         activity: '活动时间线',
         activityEmpty: '暂无活动',
         refresh: '刷新',
+        manual: '立即复盘',
+        manualQueued: '已加入复盘队列',
+        preview: 'review 实时输出',
+        elapsed: '已运行 {s}s',
         saved: '已保存',
         saveFailed: '保存失败',
         'action.create': '新建',
@@ -72,7 +76,11 @@ window.__ModuleLoader__.load({
         'written.pluginEmpty': 'No distilled skills yet',
         activity: 'Activity timeline',
         activityEmpty: 'No activity',
-        refresh: 'Refresh',
+        refresh: 'Refresh now',
+        manual: 'Review now',
+        manualQueued: 'Queued for review',
+        preview: 'Live review output',
+        elapsed: 'running {s}s',
         saved: 'Saved',
         saveFailed: 'Save failed',
         'action.create': 'create',
@@ -164,6 +172,19 @@ window.__ModuleLoader__.load({
             .catch(function () {})
         }
 
+        var manualState = React.useState(null) // null | 'queued' | 'started' | 'already-running'
+        var manualFlash = manualState[0]
+        var setManualFlash = manualState[1]
+        var reviewNow = function () {
+          fetch('/hermes-loop/api/review-now', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ sessionId: sessionId || '' }),
+          }).then(function (r) { return r.json() })
+            .then(function (d) { setManualFlash(d.state || 'started'); setTimeout(function () { setManualFlash(null) }, 2500); setNonce(function (n) { return n + 1 }) })
+            .catch(function () {})
+        }
+
         if (error !== null && data === null) {
           return h('div', { className: 'hl-wrap' }, h('div', { className: 'hl-err' }, error))
         }
@@ -190,8 +211,21 @@ window.__ModuleLoader__.load({
                 : runningReview ? t('running')
                 : (data.queuedCount > 0 ? t('queued', { n: data.queuedCount }) : t('idle'))),
             h('span', { style: { flex: 1 } }),
+            h('button', {
+              className: 'hl-chip' + (runningReview ? ' on' : ''),
+              disabled: runningReview === true,
+              title: runningReview ? t('running') : undefined,
+              onClick: reviewNow,
+            }, t('manual')),
             h('button', { className: 'hl-chip', onClick: function () { setNonce(function (n) { return n + 1 }) } }, t('refresh')),
             flash ? h('span', { className: 'hl-mut' }, t('saved')) : null),
+          runningReview && data.running.preview
+            ? h('div', { className: 'hl-card' },
+              h('h3', null, t('preview')),
+              h('div', { style: { whiteSpace: 'pre-wrap', fontFamily: 'ui-monospace,monospace', fontSize: '11px', opacity: .75, maxHeight: '160px', overflow: 'auto' } },
+                String(data.running.preview).slice(-800)))
+            : null,
+          manualFlash === 'queued' || manualFlash === 'already-running' ? h('div', { className: 'hl-mut' }, t('manualQueued')) : null,
 
           // 设置卡：模式 + 阈值
           h('div', { className: 'hl-card' },
