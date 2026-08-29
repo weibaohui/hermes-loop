@@ -33,8 +33,8 @@ function loadSchemastery() {
   schemaRequireError = errors.join(' | ')
   return null
 }
-let Schema = loadSchemastery()
 let schemaRequireError = null
+let Schema = loadSchemastery()
 
 const KEbab_NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 const DESCRIPTION_MAX = 500
