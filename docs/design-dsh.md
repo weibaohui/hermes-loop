@@ -162,7 +162,7 @@ skill writer
 
 - **目标目录**（rank 语义，见实证 §1.7）：
   - 全局经验 → `~/.dsh/skills/<name>/SKILL.md`（rank 400，与 skills-management installedDir 相同，两边都能看到对方的刷新）；
-  - workspace 特有经验 → `<projectRoot>/.dsh/skills/<name>/SKILL.md`（rank 100，遮蔽用户级）——判定依据：转写中的 cwd / workspaceRegistry 归属；v1 先只写全局，v2 加项目级；
+  - ~~workspace 特有经验 → `<projectRoot>/.dsh/skills/<name>/SKILL.md`~~（**2026-08-29 经评审取消**：依赖"cwd 向上找 .git"推导项目根，边界不稳定——非仓库目录、子模块、多根工作区都会导致写错位置或回退，收益不抵复杂度。**统一只写全局** `~/.dsh/skills/`；项目私货由用户手动放项目目录或用 `disable-model-invocation` 管理）；
 - **写入格式**：目录 + SKILL.md；frontmatter `name`（kebab-case）+ `description`（非空，建议 ≤500 字符对齐目录渲染截断；Hermes 的 60 字符是它自家索引的限制，dsh 不适用）；body 章节规范 When to Use / Prerequisites / Procedure / Pitfalls / Verification（对齐 Hermes，同时喂给 dsh 的 skill 工具加载习惯）；
 - **read-before-write 守卫（两步，缺一不可）**：patch 动作要求 review 输入里包含目标 skill 的当前 body（runner 在构造 prompt 时读取并注入，同步计算 `baseHash`，见 §4 输入第 3 条）；
   - **① CAS 比对**：writer 写入前**再读一次**目标文件，计算 sha256 与结论里的 `baseHash` 比对，不一致（review 期间被改过）→ 拒绝并重排 review；同时校验 `baseDescription` 与当前 frontmatter 一致。写入是插件进程内同步执行的，再读一次即可，无需文件锁；
@@ -206,5 +206,5 @@ hermes-loop:
 ## 9. 分阶段实现计划（v2 修订）
 
 - **v0.1（最小闭环）**：`session/event` 订阅 + 阈值/冷却/排除逻辑（含 perSession abort 链路，§3.6 伪代码）+ review runner（agents.create + restrict + whenIdle + 事件泵，复用 skills-management 的 runShareInProcess 模式）+ JSON 结论解析 + auto 写入 `~/.dsh/skills` + CAS 守卫（§6 两步）+ settings + ctx.effect 生命周期清理。验收：跑 10+ turn 的真实会话，确认 review 触发、skill 落盘、**下一个新会话的 available_skills 目录里出现该 skill**；
-- **v0.2（信任与体验）**：~~approval 模式 + pending 目录 + skills-management 客户端待审列表~~（approval 宿主侧已实现；**待审 UI 经评审取消**）；~~疑似相关 skill 全文注入~~（提前至 v0.1 完成）；**剩余**：order 51 的 in-session patch 纪律 section；项目级 skill 目录写入；review 结论回显到来源会话（`session.append('session/title', ...)` 或 plugin source followup，跑通后再定）；
-- **v0.3（防碎片化）**：疑似相关 skill 全文注入；Curator 定时 pass（stale 标记、归档不删除）；信号加速触发（失败率/纠正词表）。
+- **v0.2（信任与体验）——已完结**：approval 模式 + pending 目录 ✅（~~待审 UI~~ 经评审取消，Hermes 亦无 GUI）；~~疑似相关 skill 全文注入~~ 提前至 v0.1 ✅；order 51 in-session patch 纪律 section ✅（7e151d3）；review 结论回显到来源会话 ✅（`session.append('user/message')` + plugin notice，1386a4d 前后）；~~项目级 skill 目录写入~~ 经评审取消（不稳定，统一写全局）。
+- **v0.3（防碎片化）**：~~疑似相关 skill 全文注入~~（提前至 v0.1 完成）；Curator 定时 pass（stale 标记、归档不删除）；信号加速触发（失败率/纠正词表）。候选新增：**memory 通道**（dsh 无原生 memory 机制；Hermes 原版 review 本就 memory+skill 合体，触发/守卫全复用；待出设计补充——载体 `~/.dsh/memory/MEMORY.md`、双结论协议、systemPrompt 注入）。

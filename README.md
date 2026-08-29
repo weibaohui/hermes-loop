@@ -25,7 +25,7 @@ fenced JSON 结论 { action: nothing | create | patch, ... }（解析失败 fail
 skill writer（插件代码执行，agent 不落盘）
   │  patch → CAS 重读比对 baseHash → 临时文件 + 原子 rename
   │  mode=auto → $DSH_HOME/skills/<name>/SKILL.md
-  │  mode=approval → $DSH_HOME/hermes-loop/pending/<id>.json（v0.2 接 UI）
+  │  mode=approval → $DSH_HOME/hermes-loop/pending/<id>.json（手动处理）
   │  mode=log-only → 仅 ctx.logger.info
   ▼
 chokidar watcher 自动失效 registry → 下一个新会话的 available_skills 即可见
@@ -88,5 +88,5 @@ dsh 侧的现状：hermes-prompt 插件只注入了"收尾沉淀纪律"，靠模
 
 - **触发与 Hermes 同构**：宿主插件 `ctx.on('session/event')` 订阅所有会话的 `turn/end`（completed），按阈值 + 冷却触发——不需要 prompt 自报，不需要平台改动；
 - **review agent 零工具**：`agents.create` + `tools.restrict({allow: []})`，输入 = 既有 skill 目录快照 + 疑似相关 skill 全文 + 会话转写尾部，输出 = 结构化 JSON 结论，写入由插件代码执行（CAS 与审批都是代码级守卫）；
-- **写入即可见**：直接写 `$DSH_HOME/skills/`（全局；workspace 级 v0.2），chokidar watcher 自动失效 registry 缓存，下一会话的 available_skills 目录即出现；
-- 后续：v0.2 审批与客户端 UI、项目级写入、结论回显来源会话 → v0.3 Curator 防碎片化、信号加速触发。
+- **写入即可见**：直接写 `$DSH_HOME/skills/`（全局库；经评审决定不做项目级写入），chokidar watcher 自动失效 registry 缓存，下一会话的 available_skills 目录即出现；
+- 已完成（v0.2）：客户端面板（对话区 Hermes Loop tab）、模式切换、结论回显到来源会话、in-session patch 纪律 section；审批 UI 与项目级写入经评审取消 → v0.3：Curator 防碎片化、信号加速触发；候选：memory 通道。
