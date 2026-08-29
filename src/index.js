@@ -18,10 +18,23 @@ const { createHash, randomUUID } = require('node:crypto')
 const fsP = require('node:fs/promises')
 const { join, resolve, sep } = require('node:path')
 const { homedir } = require('node:os')
-// settings 服务要求 schemastery schema（需要可调用校验 + toJSON，zod 不兼容）
-let Schema = null
+// settings 服务要求 schemastery schema（需要可调用校验 + toJSON，zod 不兼容）。
+// 不能依赖打包依赖：宿主沙箱 require 解析 .pnpm 软链邻居时抛 ERR_INTERNAL_ASSERTION。
+// ① 先试宿主 dsh 全局安装里的 vendored 副本（settings 服务自己用的就是它）；
+// ② 再退回标准 require（本地开发/测试环境）。都失败则无 settings 注册（功能仍可用）。
+function loadSchemastery() {
+  const candidates = []
+  if (process.execPath.endsWith('/node')) {
+    candidates.push(join(process.execPath, '..', '..', 'lib', 'node_modules', '@deepseek-ai', 'dsh', 'node_modules', '@deepseek-ai', 'schemastery', 'lib', 'index.cjs'))
+  }
+  const { createRequire } = require('node:module')
+  for (const candidate of candidates) {
+    try { return createRequire(candidate)(candidate) } catch {}
+  }
+  try { return require('@deepseek-ai/schemastery') } catch { return null }
+}
+let Schema = loadSchemastery()
 let schemaRequireError = null
-try { Schema = require('@deepseek-ai/schemastery') } catch (e) { Schema = null; schemaRequireError = String(e && e.code || e) }
 
 const KEbab_NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 const DESCRIPTION_MAX = 500
