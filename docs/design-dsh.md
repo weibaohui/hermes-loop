@@ -23,7 +23,7 @@
 | skill 写入即对后续会话可见 | skill-filesystem 的 chokidar watcher（~200ms 稳定阈值）自动 invalidate registry，下一个 pre-step 重新 snapshot，digest 变化即发布新目录消息 | ✅ 对等，**无需跨插件 invalidate**（实证：skill-filesystem/src/index.ts:528-588） |
 | MEMORY.md/USER.md | v1 不做（见 §7 范围） | ➖ 后续 |
 | Curator 定时维护 | `ctx.effect` + setInterval（scheduled-items 模式） | ✅ v3 |
-| write_approval 审批 | pending 目录 + skills-management 客户端 UI | ✅ v2 |
+| write_approval 审批 | pending 目录（已实现；**审批 UI 经评审决定不做**——Hermes 侧也只有 CLI 斜杠命令没有 GUI，dsh 侧 pending JSON 可直接手批） | ✅ 宿主侧 v0.1 / UI 取消 |
 
 **结论：dsh 插件机制可以对等实现 Hermes Loop 的全部核心功能，且不需要任何 dsh 平台改动。**
 
@@ -170,9 +170,9 @@ skill writer
 - **防覆盖**：create 时目标已存在 → 降级为 nothing + 日志（避免静默覆盖用户手写的 skill；合并留给 v3 Curator）；
 - **mode 行为**：
   - `auto`：写入目标目录，即刻生效；
-  - `approval`：写入 pending 目录，等用户审批；
+  - `approval`：写入 pending 目录，等用户审批（无审批 UI——经 2026-08-29 评审决定不做，批 = 手动把 pending JSON 里的内容落到目标路径，或改用 auto 模式）；
   - `log-only`：**既不写 skill 目录也不写 pending**，review 结论 JSON 仅经 `ctx.logger.info` 输出——用于调试触发阈值与 prompt 质量，观察期默认值建议用它；
-- **approval 模式**：写入 pending 目录 `<pendingDir>/<id>.json`（含拟写入的完整文件 + diff），v2 在 skills-management 客户端加待审列表。**pendingDir 解析对齐 skills-management installedDir 的逻辑**（skills-management/src/index.js:516）：`process.env.DSH_HOME ? join(DSH_HOME, 'hermes-loop', 'pending') : join(homedir(), '.dsh', 'hermes-loop', 'pending')`——否则设了 `DSH_HOME` 的用户里 pending 与 skill 会落在两个不同的根下；
+- **approval 模式**：写入 pending 目录 `<pendingDir>/<id>.json`（含拟写入的完整文件 + diff）。**不做审批 UI**（2026-08-29 评审决议：Hermes 自身也只有 `/skills approve` 式 CLI 命令而无 GUI，dsh 侧手动处理 pending JSON 已够用）。**pendingDir 解析对齐 skills-management installedDir 的逻辑**（skills-management/src/index.js:516）：`process.env.DSH_HOME ? join(DSH_HOME, 'hermes-loop', 'pending') : join(homedir(), '.dsh', 'hermes-loop', 'pending')`——否则设了 `DSH_HOME` 的用户里 pending 与 skill 会落在两个不同的根下；
 - **可见性**：无需任何 invalidate 动作——chokidar watcher ~200ms 后自动失效 registry 缓存，下一 pre-step 重新 snapshot（实证 §1.6/§1.7）。**v1 的开放问题已解决**。唯一例外：watch 被关闭的环境才需要手动失效，运行时探测 `watch` 配置即可。
 
 ## 7. 范围与配置
@@ -206,5 +206,5 @@ hermes-loop:
 ## 9. 分阶段实现计划（v2 修订）
 
 - **v0.1（最小闭环）**：`session/event` 订阅 + 阈值/冷却/排除逻辑（含 perSession abort 链路，§3.6 伪代码）+ review runner（agents.create + restrict + whenIdle + 事件泵，复用 skills-management 的 runShareInProcess 模式）+ JSON 结论解析 + auto 写入 `~/.dsh/skills` + CAS 守卫（§6 两步）+ settings + ctx.effect 生命周期清理。验收：跑 10+ turn 的真实会话，确认 review 触发、skill 落盘、**下一个新会话的 available_skills 目录里出现该 skill**；
-- **v0.2（信任与体验）**：approval 模式 + pending 目录 + skills-management 客户端待审列表（注意 NO class component / NO createRoot）；order 51 的 in-session patch 纪律 section；项目级 skill 目录写入；review 结论回显到来源会话（`session.append('session/title', ...)` 或 plugin source followup，跑通后再定）；
+- **v0.2（信任与体验）**：~~approval 模式 + pending 目录 + skills-management 客户端待审列表~~（approval 宿主侧已实现；**待审 UI 经评审取消**）；~~疑似相关 skill 全文注入~~（提前至 v0.1 完成）；**剩余**：order 51 的 in-session patch 纪律 section；项目级 skill 目录写入；review 结论回显到来源会话（`session.append('session/title', ...)` 或 plugin source followup，跑通后再定）；
 - **v0.3（防碎片化）**：疑似相关 skill 全文注入；Curator 定时 pass（stale 标记、归档不删除）；信号加速触发（失败率/纠正词表）。

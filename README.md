@@ -49,7 +49,7 @@ chokidar watcher 自动失效 registry → 下一个新会话的 available_skill
 | key | 默认 | 说明 |
 |---|---|---|
 | `enabled` | `true` | 总开关（每事件实时读取） |
-| `mode` | `auto` | `auto` 写入 / `approval` 进 pending / `log-only` 只记日志 |
+| `mode` | `auto` | `auto` 写入 / `approval` 进 pending（无审批 UI，手动处理）/ `log-only` 只记日志 |
 | `provider` / `model` | `""` | review 模型路由，空=跟随部署默认（建议配便宜模型） |
 | `turnInterval` | `10` | completed turn 阈值 |
 | `toolCallInterval` | `10` | 同窗口 tool/call 计数（第二触发线，turn 尾结算） |
