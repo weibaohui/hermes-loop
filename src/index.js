@@ -751,7 +751,7 @@ module.exports = {
       const current = sessionId !== undefined && sessionId !== '' ? sessions[sessionId] : undefined
       return {
         settings: eff,
-        running: running !== null ? { sessionId: running.sessionId, startedAt: runningSince } : null,
+        running: running !== null ? { sessionId: running.sessionId, startedAt: runningSince, preview: running.preview } : null,
         queuedCount: queued.size,
         sessions,
         current: current || { turns: 0, toolCalls: 0, lastReviewAt: undefined },
