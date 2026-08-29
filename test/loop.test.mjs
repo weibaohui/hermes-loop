@@ -361,3 +361,81 @@ function reqBody(obj) {
   return req
 }
 reqBody.__doc = 'returns a live EventEmitter; route.handler must attach listeners synchronously'
+
+// ── loop-aware section: registers only when hermes-prompt is absent ────
+
+test('loop-aware section registers when hermesPrompt marker is absent', () => {
+  const sections = []
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    on: () => () => {},
+    effect: (fn) => fn(),
+    get: () => undefined, // 无 hermes-prompt 标记
+    systemPrompt: { section: (s) => { sections.push(s); return () => {} } },
+    skills: { snapshot: async () => ({ skills: [] }) },
+    settings: undefined,
+  }
+  plugin.apply(ctx, {})
+  assert.equal(sections.length, 1)
+  assert.equal(sections[0].name, 'hermes:loop-aware')
+  assert.equal(sections[0].order, 51)
+})
+
+test('loop-aware section is skipped when hermesPrompt marker is present', () => {
+  const sections = []
+  const ctx = {
+    logger: { info() {}, warn() {} },
+    on: () => () => {},
+    effect: (fn) => fn(),
+    get: (name) => name === 'hermesPrompt' ? { version: '0.1.0' } : undefined,
+    systemPrompt: { section: (s) => { sections.push(s); return () => {} } },
+    skills: { snapshot: async () => ({ skills: [] }) },
+    settings: undefined,
+  }
+  plugin.apply(ctx, {})
+  assert.equal(sections.length, 0)
+})
+
+// ── source-session notice: appended as plugin notice on write ──────────
+
+test('write outcomes echo a plugin-notice user/message into the source session', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-echo-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const notices = []
+    const conclusion = JSON.stringify({ action: 'create', skill: 'echo-skill', description: 'd', body: 'b', rationale: '值得存' })
+    const services = fakeServices('```json\n' + conclusion + '\n```')
+    const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, services)
+    const session = {
+      id: 'session-echo',
+      header: {},
+      deriveMessages: () => [],
+      append: (type, data) => { notices.push({ type, data }) },
+    }
+    t.fire(session, completedTurn)
+    await new Promise((r) => setTimeout(r, 100))
+    assert.equal(notices.length, 1)
+    assert.equal(notices[0].type, 'user/message')
+    assert.equal(notices[0].data.source.kind, 'plugin')
+    assert.equal(notices[0].data.source.plugin, 'hermes-loop')
+    assert.equal(notices[0].data.source.form, 'notice')
+    assert.match(notices[0].data.source.summary, /echo-skill/)
+    assert.match(notices[0].data.source.summary, /值得存/)
+    // append 抛错不影响写入流程
+    const sessionBroken = {
+      id: 'session-echo-broken',
+      header: {},
+      deriveMessages: () => [],
+      append() { throw new Error('append not allowed here') },
+    }
+    t.fire(sessionBroken, completedTurn)
+    await new Promise((r) => setTimeout(r, 100))
+    const written = await readFile(join(home, 'skills', 'echo-skill', 'SKILL.md'), 'utf8')
+    assert.match(written, /^---/)
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})

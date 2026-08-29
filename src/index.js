@@ -358,6 +358,32 @@ module.exports = {
       return { ...DEFAULTS, ...config }
     }
 
+    // ── In-session patch 纪律 section（design §5，辅助非依赖）──
+    // hermes-prompt 已装（ctx.provide 标记）则跳过——其纪律宣言已覆盖同款要求，
+    // 两套同时注册会让主 agent 收到重复的沉淀指令。
+    if (ctx.systemPrompt && typeof ctx.systemPrompt.section === 'function') {
+      let hermesPromptPresent = false
+      try {
+        const marker = ctx.get && ctx.get('hermesPrompt', false)
+        hermesPromptPresent = marker !== undefined && marker !== null
+      } catch {}
+      if (!hermesPromptPresent) {
+        ctx.effect(() => ctx.systemPrompt.section({
+          name: 'hermes:loop-aware', // 与 hermes-prompt 的 hermes:discipline 不同名——同层同名抛错
+          order: 51,
+          text: [
+            '# 收尾沉淀（后台学习循环在运行）',
+            '',
+            '- 收尾时若发现**本会话已加载的 skill** 有错、缺步骤或过时：直接用你的工具**当场修正它**，不要留到后台复盘（后台也会复盘，但当场修的上下文最全）。',
+            '- 其余沉淀（新 skill、经验教训）交给后台学习循环处理，**不要**主动写新 skill 文件——避免两套纪律打架。',
+          ].join('\n'),
+        }), 'hermes-loop: loop-aware section')
+        ctx.logger.info && ctx.logger.info('hermes-loop: loop-aware section registered (hermes-prompt absent)')
+      } else {
+        ctx.logger.info && ctx.logger.info('hermes-loop: skipping loop-aware section (hermes-prompt provides discipline)')
+      }
+    }
+
     // ── Trigger state ──
     // windows: per-session counters since the last review entered the runner.
     // queued:  at most one waiting review per session (a newer one replaces it).
@@ -490,7 +516,7 @@ module.exports = {
           ctx.logger.info(`hermes-loop: review of session ${sessionId} → nothing. ${conclusion.rationale}`)
           return
         }
-        await dispatchConclusion(conclusion, { eff, sessionId })
+        await dispatchConclusion(conclusion, { eff, sessionId, session })
       } catch (e) {
         trace('review-error', { sessionId, message: String(e && e.message || e) })
         throw e
@@ -502,7 +528,21 @@ module.exports = {
       }
     }
 
-    const dispatchConclusion = async (conclusion, { eff, sessionId }) => {
+    // ── 结论回显到来源会话（design §9 v0.2）──
+    // session.append('user/message') + plugin source + form:'notice' —— 与
+    // "上下文已压缩"同款的单行折叠通知：模型下一 turn 可见，界面显示为一行摘要。
+    // 回显失败绝不影响写入结果（best-effort）。
+    const notifySourceSession = (session, summary) => {
+      if (!session || typeof session.append !== 'function') return
+      try {
+        session.append('user/message', {
+          content: [{ type: 'text', text: summary }],
+          source: { kind: 'plugin', plugin: 'hermes-loop', form: 'notice', summary },
+        })
+      } catch (e) { ctx.logger.warn(`hermes-loop: source-session notice: ${e && e.message}`) }
+    }
+
+    const dispatchConclusion = async (conclusion, { eff, sessionId, session }) => {
       const logHead = `hermes-loop: ${conclusion.action} '${conclusion.skill}' (from session ${sessionId})`
       trace('dispatch', { sessionId, mode: eff.mode, action: conclusion.action, skill: conclusion.skill })
       if (eff.mode === 'log-only') {
@@ -516,6 +556,7 @@ module.exports = {
         await fsP.mkdir(dir, { recursive: true })
         await atomicWrite(join(dir, `${id}.json`), JSON.stringify(payload, null, 2))
         trace('staged', { id, dir, sessionId })
+        notifySourceSession(session, `后台复盘产出「${conclusion.skill}」已暂存待确认（mode=approval）：${conclusion.rationale || conclusion.action}`)
         ctx.logger.info(`${logHead} — staged to ${dir} for approval`)
         return
       }
@@ -523,8 +564,12 @@ module.exports = {
       trace('write-outcome', { sessionId, skill: conclusion.skill, ...outcome })
       if (outcome.result === 'created' || outcome.result === 'patched') {
         ctx.logger.info(`${logHead} — ${outcome.result} → ${outcome.path}`)
+        notifySourceSession(session, `后台复盘已${outcome.result === 'created' ? '新建' : '修补'}技能「${conclusion.skill}」，下一个会话即可使用${conclusion.rationale ? `：${conclusion.rationale}` : ''}`)
       } else {
         ctx.logger.warn(`${logHead} — ${outcome.result}. ${outcome.detail || ''}`)
+        if (outcome.result === 'cas-conflict' || outcome.result === 'create-conflict') {
+          notifySourceSession(session, `后台复盘想${conclusion.action === 'patch' ? '修补' : '新建'}技能「${conclusion.skill}」但被守卫拒绝（${outcome.detail || outcome.result}），本次未写入`)
+        }
       }
     }
 
