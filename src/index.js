@@ -333,7 +333,7 @@ module.exports = {
   // 静态注入：apply 在这些服务就绪后才运行（at-file 同款模式）。
   // 动态 ctx.inject(['settings'], cb) 在 apply 内不会触发——skills-management 的
   // settings 注册就是这么静默失效的（平台 gotcha）。
-  inject: ['skills', 'settings', 'agents', 'agentDefaultModel'],
+  inject: ['skills', 'settings', 'agents', 'agentDefaultModel', 'systemPrompt'],
   __internals: {
     reasonKind, contentToText, renderTranscript, tokenize, rankSuspects,
     extractFencedJson, parseConclusion, sha256, buildSkillMd, applyConclusion,
