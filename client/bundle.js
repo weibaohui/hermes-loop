@@ -136,7 +136,9 @@ window.__ModuleLoader__.load({
       '.hl-table th{opacity:.55;text-align:left;font-weight:500;padding:2px 8px 4px 0}',
       '.hl-table td{padding:3px 8px 3px 0;border-top:1px solid var(--dsw-alias-border-l3,rgba(128,128,128,.15));font-variant-numeric:tabular-nums}',
       '.hl-scroll{max-height:260px;overflow:auto}',
-      '.hl-help{display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.35));border-radius:50%;font-size:10px;opacity:.6;cursor:help;vertical-align:middle}',
+      '.hl-help{position:relative;display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.35));border-radius:50%;font-size:10px;opacity:.75;cursor:help;vertical-align:middle}',
+      '.hl-help::after{content:attr(data-tip);position:absolute;top:calc(100% + 8px);right:-6px;z-index:60;width:min(360px,72vw);white-space:normal;background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-1,inherit);border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.3));border-radius:8px;padding:10px 12px;font-size:12px;font-weight:400;line-height:1.7;text-align:left;box-shadow:0 6px 20px rgba(0,0,0,.2);opacity:0;pointer-events:none;transition:opacity .12s}',
+      '.hl-help:hover::after{opacity:1}',
     ].join('')
 
     var fmtTime = function (iso) {
@@ -324,14 +326,14 @@ window.__ModuleLoader__.load({
                         h('th', null, t('usage.calls')),
                         h('th', null, t('usage.last')),
                         h('th', null, t('usage.status'), ' ',
-                          h('span', { className: 'hl-help', title: t('usage.statusHelp') }, '?')))),
+                          h('span', { className: 'hl-help', 'data-tip': t('usage.statusHelp') }, '?')))),
                       h('tbody', null, u.rows.map(function (row, i) {
                         var zombie = row.count === 0
                         var statusText = row.modelInvocable === undefined ? '—' : (row.modelInvocable ? t('usage.modelVisible') : t('usage.modelDisabled'))
                         return h('tr', { key: i, style: zombie ? { opacity: .6 } : null },
                           h('td', { className: 'hl-skill' }, row.skill),
-                          h('td', null, zombie ? h('span', { className: 'hl-mut', title: t('usage.statusHelp') }, '—') : row.count),
-                          h('td', { className: 'hl-mut' }, row.lastUsedAt ? fmtTime(row.lastUsedAt) : h('span', { title: t('usage.statusHelp') }, '—')),
+                          h('td', null, zombie ? h('span', { className: 'hl-help hl-mut', 'data-tip': t('usage.statusHelp') }, '—') : row.count),
+                          h('td', { className: 'hl-mut' }, row.lastUsedAt ? fmtTime(row.lastUsedAt) : h('span', { className: 'hl-help', 'data-tip': t('usage.statusHelp') }, '—')),
                           h('td', null, h('span', { className: 'hl-tag' + (row.modelInvocable === false ? ' hl-err' : '') }, statusText)))
                       })))))
                 : h('div', { className: 'hl-mut' }, t('usage.empty')))
