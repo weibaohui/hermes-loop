@@ -43,16 +43,17 @@ window.__ModuleLoader__.load({
         refresh: '刷新',
         saved: '已保存',
         saveFailed: '保存失败',
-        'ev.threshold': '计数达到阈值',
-        'ev.review-start': 'review 开始',
-        'ev.review-inputs': 'review 输入就绪',
-        'ev.review-agent-created': 'review agent 已创建',
-        'ev.review-output': 'review 输出结论',
-        'ev.dispatch': '分发结论',
-        'ev.write-outcome': '写入结果',
-        'ev.staged': '进入待审批',
-        'ev.review-error': 'review 出错',
-        'ev.armed': '循环启动',
+        'out.created': '新建',
+        'out.patched': '修补',
+        'out.staged': '待审批',
+        'out.nothing': '无可沉淀',
+        'out.unparseable': '结论解析失败',
+        'out.write-failed': '写入被拒',
+        'out.error': '复盘出错',
+        'out.running': '复盘中…',
+        'timelineEmpty': '还没有复盘记录 —— 达到触发阈值后每次复盘会在这里留一行',
+        'inputs': '输入 {n} 条消息 · 目录 {c} 条技能',
+        'suspects': '疑似相关：{list}',
         'action.create': '新建',
         'action.patch': '修补',
         'action.staged': '待审',
@@ -85,16 +86,17 @@ window.__ModuleLoader__.load({
         refresh: 'Refresh',
         saved: 'Saved',
         saveFailed: 'Save failed',
-        'ev.threshold': 'Threshold reached',
-        'ev.review-start': 'Review started',
-        'ev.review-inputs': 'Review inputs ready',
-        'ev.review-agent-created': 'Review agent created',
-        'ev.review-output': 'Review conclusion',
-        'ev.dispatch': 'Conclusion dispatched',
-        'ev.write-outcome': 'Write outcome',
-        'ev.staged': 'Staged for approval',
-        'ev.review-error': 'Review error',
-        'ev.armed': 'Loop armed',
+        'out.created': 'created',
+        'out.patched': 'patched',
+        'out.staged': 'staged',
+        'out.nothing': 'nothing to save',
+        'out.unparseable': 'unparseable conclusion',
+        'out.write-failed': 'write rejected',
+        'out.error': 'review error',
+        'out.running': 'reviewing…',
+        'timelineEmpty': 'No reviews yet — each review leaves one line here once a threshold fires',
+        'inputs': '{n} messages · catalog {c}',
+        'suspects': 'suspects: {list}',
         'action.create': 'create',
         'action.patch': 'patch',
         'action.staged': 'staged',
@@ -275,18 +277,28 @@ window.__ModuleLoader__.load({
                 : h('div', { className: 'hl-mut' }, emptyText))
           })(),
 
-          // 活动时间线
+          // 复盘历史：每次复盘一行（结果标签 + 技能 + 结论理由 + 输入规模）
           h('div', { className: 'hl-card' },
             h('h3', null, t('activity')),
-            data.activity && data.activity.length > 0
-              ? h('ul', { className: 'hl-timeline' }, data.activity.slice().reverse().slice(0, 30).map(function (e, i) {
-                return h('li', { key: i },
-                  h('time', null, fmtTime(e.at)),
-                  h('span', { className: e.event === 'review-error' ? 'hl-err' : null }, t('ev.' + e.event)),
-                  e.skill ? h('span', { className: 'hl-skill' }, e.skill) : null,
-                  e.message ? h('span', { className: 'hl-mut' }, String(e.message).slice(0, 120)) : null)
-              }))
-              : h('div', { className: 'hl-mut' }, t('activityEmpty'))))
+            data.reviews && data.reviews.length > 0
+              ? h('ul', { className: 'hl-timeline' }, data.reviews.slice(0, 30).map(function (r, i) {
+                var bad = r.outcome === 'error' || r.outcome === 'unparseable' || r.outcome === 'write-failed'
+                var lines = [
+                  h('li', { key: i },
+                    h('time', null, fmtTime(r.at)),
+                    h('span', { className: 'hl-tag' + (bad ? ' hl-err' : '') }, t('out.' + r.outcome)),
+                    r.skill ? h('span', { className: 'hl-skill' }, r.skill) : null,
+                    r.rationale ? h('span', { className: 'hl-mut' }, String(r.rationale).slice(0, 90)) : null),
+                ]
+                if (r.messages !== undefined) {
+                  var inputText = t('inputs', { n: r.messages, c: r.catalogSize })
+                  if (r.suspects && r.suspects.length > 0) inputText += ' · ' + t('suspects', { list: r.suspects.join('、') })
+                  lines.push(h('li', { key: i + '-d', className: 'hl-mut', style: { paddingLeft: '52px', fontSize: '11px' } }, inputText.slice(0, 140)))
+                }
+                if (r.detail) lines.push(h('li', { key: i + '-e', className: 'hl-err', style: { paddingLeft: '52px', fontSize: '11px' } }, String(r.detail).slice(0, 140)))
+                return lines
+              }).reduce(function (a, b) { return a.concat(b) }, []))
+              : h('div', { className: 'hl-mut' }, t('timelineEmpty'))))
       }
     }
 

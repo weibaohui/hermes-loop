@@ -481,9 +481,11 @@ module.exports = {
         // 5. conclusion → writer
         const conclusion = parseConclusion(finalText)
         if (conclusion === undefined) {
+          trace('conclusion', { sessionId, action: 'unparseable', head: finalText.slice(0, 160).replace(/\s+/g, ' ') })
           ctx.logger.warn(`hermes-loop: unparseable review conclusion for session ${sessionId}; dropped (fail-closed). head=${finalText.slice(0, 120).replace(/\s+/g, ' ')}`)
           return
         }
+        trace('conclusion', { sessionId, action: conclusion.action, skill: conclusion.skill, rationale: String(conclusion.rationale || '').slice(0, 300) })
         if (conclusion.action === 'nothing') {
           ctx.logger.info(`hermes-loop: review of session ${sessionId} → nothing. ${conclusion.rationale}`)
           return
@@ -629,6 +631,42 @@ module.exports = {
           sessionId: e.sessionId || dispatchSessionBySkill.get(e.skill),
         }))
         .reverse()
+      // 把碎片事件聚成"每次复盘一行"：review-start 开一个聚类，后续事件补全它的结果
+      const reviews = []
+      let currentReview = null
+      for (const e of activity) {
+        if (e.event === 'review-start') {
+          currentReview = { at: e.at, sessionId: e.sessionId, outcome: 'running', action: undefined, skill: undefined, rationale: undefined, suspects: undefined, catalogSize: undefined, messages: undefined, detail: undefined }
+          reviews.push(currentReview)
+          continue
+        }
+        if (currentReview === null) continue
+        if (e.sessionId !== undefined && e.sessionId !== currentReview.sessionId && e.event !== 'conclusion') continue
+        if (e.event === 'review-inputs') {
+          currentReview.messages = e.messages
+          currentReview.catalogSize = e.catalogSize
+          currentReview.suspects = e.suspects
+        } else if (e.event === 'conclusion') {
+          currentReview.action = e.action
+          currentReview.skill = e.skill || undefined
+          currentReview.rationale = e.rationale || undefined
+          if (e.action === 'unparseable') { currentReview.outcome = 'unparseable'; currentReview.detail = e.head }
+          else if (e.action === 'nothing') currentReview.outcome = 'nothing'
+        } else if (e.event === 'dispatch') {
+          currentReview.action = e.action
+          currentReview.skill = e.skill
+        } else if (e.event === 'staged') {
+          currentReview.outcome = 'staged'
+          currentReview.skill = e.skill || currentReview.skill
+        } else if (e.event === 'write-outcome') {
+          currentReview.skill = e.skill || currentReview.skill
+          if (e.result === 'created' || e.result === 'patched') currentReview.outcome = e.result
+          else { currentReview.outcome = 'write-failed'; currentReview.detail = e.detail || e.result }
+        } else if (e.event === 'review-error') {
+          currentReview.outcome = 'error'
+          currentReview.detail = e.message
+        }
+      }
       const current = sessionId !== undefined && sessionId !== '' ? sessions[sessionId] : undefined
       return {
         settings: eff,
@@ -637,6 +675,7 @@ module.exports = {
         sessions,
         current: current || { turns: 0, toolCalls: 0, lastReviewAt: undefined },
         activity,
+        reviews: reviews.reverse(),
         written,
       }
     }
