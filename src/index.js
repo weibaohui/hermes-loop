@@ -499,7 +499,6 @@ module.exports = {
               const text = contentToText(ev.data.message.content)
               if (text.trim() !== '') finalText = text
             } else if (ev.type === 'assistant/chunk' && ev.data && ev.data.chunk) {
-              trace('chunk-type', { sessionId, type: ev.data.chunk.type, hasText: Boolean(ev.data.chunk.text) })
               // reasoning-delta 占了 reasoning 模型输出的绝大部分时长——预览里带标记展示，
               // 否则运行期间卡片几乎总是空白
               const chunk = ev.data.chunk
