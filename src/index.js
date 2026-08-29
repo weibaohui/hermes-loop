@@ -23,15 +23,15 @@ const { homedir } = require('node:os')
 // ① 先试宿主 dsh 全局安装里的 vendored 副本（settings 服务自己用的就是它）；
 // ② 再退回标准 require（本地开发/测试环境）。都失败则无 settings 注册（功能仍可用）。
 function loadSchemastery() {
-  const candidates = []
-  if (process.execPath.endsWith('/node')) {
-    candidates.push(join(process.execPath, '..', '..', 'lib', 'node_modules', '@deepseek-ai', 'dsh', 'node_modules', '@deepseek-ai', 'schemastery', 'lib', 'index.cjs'))
-  }
+  const errors = []
   const { createRequire } = require('node:module')
-  for (const candidate of candidates) {
-    try { return createRequire(candidate)(candidate) } catch {}
+  if (process.execPath.endsWith('/node')) {
+    const hostCopy = join(process.execPath, '..', '..', 'lib', 'node_modules', '@deepseek-ai', 'dsh', 'node_modules', '@deepseek-ai', 'schemastery', 'lib', 'index.cjs')
+    try { return createRequire(hostCopy)(hostCopy) } catch (e) { errors.push(`host: ${String(e && e.message || e).slice(0, 140)}`) }
   }
-  try { return require('@deepseek-ai/schemastery') } catch { return null }
+  try { return require('@deepseek-ai/schemastery') } catch (e) { errors.push(`pkg: ${String(e && e.code || e)}`) }
+  schemaRequireError = errors.join(' | ')
+  return null
 }
 let Schema = loadSchemastery()
 let schemaRequireError = null
