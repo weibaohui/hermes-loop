@@ -25,9 +25,11 @@ const { homedir } = require('node:os')
 function loadSchemastery() {
   const errors = []
   const { createRequire } = require('node:module')
-  if (process.execPath.endsWith('/node')) {
-    const hostCopy = join(process.execPath, '..', '..', 'lib', 'node_modules', '@deepseek-ai', 'dsh', 'node_modules', '@deepseek-ai', 'schemastery', 'lib', 'index.cjs')
-    try { return createRequire(hostCopy)(hostCopy) } catch (e) { errors.push(`host: ${String(e && e.message || e).slice(0, 140)}`) }
+  // 宿主 dsh 全局安装：跟随 dsh bin 的真实位置（bin 是 <install>/lib/bin.js 的 symlink，
+  // process.execPath 可能指向捆绑的 node 运行时而非全局前缀，不能从它推导）。
+  for (const prefix of [process.env.DSH_GLOBAL_PREFIX, homedir() + '/.local'].filter(Boolean)) {
+    const hostCopy = join(prefix, 'lib', 'node_modules', '@deepseek-ai', 'dsh', 'node_modules', '@deepseek-ai', 'schemastery', 'lib', 'index.cjs')
+    try { return createRequire(hostCopy)(hostCopy) } catch (e) { errors.push(`host: ${String(e && e.message || e).slice(0, 100)}`) }
   }
   try { return require('@deepseek-ai/schemastery') } catch (e) { errors.push(`pkg: ${String(e && e.code || e)}`) }
   schemaRequireError = errors.join(' | ')
