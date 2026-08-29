@@ -43,17 +43,6 @@ window.__ModuleLoader__.load({
         refresh: '刷新',
         saved: '已保存',
         saveFailed: '保存失败',
-        'out.created': '新建',
-        'out.patched': '修补',
-        'out.staged': '待审批',
-        'out.nothing': '无可沉淀',
-        'out.unparseable': '结论解析失败',
-        'out.write-failed': '写入被拒',
-        'out.error': '复盘出错',
-        'out.running': '复盘中…',
-        'timelineEmpty': '还没有复盘记录 —— 达到触发阈值后每次复盘会在这里留一行',
-        'inputs': '输入 {n} 条消息 · 目录 {c} 条技能',
-        'suspects': '疑似相关：{list}',
         'action.create': '新建',
         'action.patch': '修补',
         'action.staged': '待审',
@@ -86,17 +75,6 @@ window.__ModuleLoader__.load({
         refresh: 'Refresh',
         saved: 'Saved',
         saveFailed: 'Save failed',
-        'out.created': 'created',
-        'out.patched': 'patched',
-        'out.staged': 'staged',
-        'out.nothing': 'nothing to save',
-        'out.unparseable': 'unparseable conclusion',
-        'out.write-failed': 'write rejected',
-        'out.error': 'review error',
-        'out.running': 'reviewing…',
-        'timelineEmpty': 'No reviews yet — each review leaves one line here once a threshold fires',
-        'inputs': '{n} messages · catalog {c}',
-        'suspects': 'suspects: {list}',
         'action.create': 'create',
         'action.patch': 'patch',
         'action.staged': 'staged',
@@ -126,9 +104,6 @@ window.__ModuleLoader__.load({
       '.hl-skill{font-weight:600;font-family:ui-monospace,monospace;font-size:12px}',
       '.hl-path{opacity:.55;font-size:11px;font-family:ui-monospace,monospace;word-break:break-all}',
       '.hl-tag{font-size:11px;border-radius:4px;padding:1px 6px;background:var(--dsw-alias-bg-layer-3,rgba(128,128,128,.2))}',
-      '.hl-timeline{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:3px;font-size:12px}',
-      '.hl-timeline li{display:flex;gap:8px;opacity:.85}',
-      '.hl-timeline time{opacity:.55;font-variant-numeric:tabular-nums;white-space:nowrap}',
       '.hl-err{color:var(--dsw-alias-state-negative,#c75050)}',
       '.hl-mut{opacity:.55}',
     ].join('')
@@ -276,29 +251,7 @@ window.__ModuleLoader__.load({
                 }))
                 : h('div', { className: 'hl-mut' }, emptyText))
           })(),
-
-          // 复盘历史：每次复盘一行（结果标签 + 技能 + 结论理由 + 输入规模）
-          h('div', { className: 'hl-card' },
-            h('h3', null, t('activity')),
-            data.reviews && data.reviews.length > 0
-              ? h('ul', { className: 'hl-timeline' }, data.reviews.slice(0, 30).map(function (r, i) {
-                var bad = r.outcome === 'error' || r.outcome === 'unparseable' || r.outcome === 'write-failed'
-                var lines = [
-                  h('li', { key: i },
-                    h('time', null, fmtTime(r.at)),
-                    h('span', { className: 'hl-tag' + (bad ? ' hl-err' : '') }, t('out.' + r.outcome)),
-                    r.skill ? h('span', { className: 'hl-skill' }, r.skill) : null,
-                    r.rationale ? h('span', { className: 'hl-mut' }, String(r.rationale).slice(0, 90)) : null),
-                ]
-                if (r.messages !== undefined) {
-                  var inputText = t('inputs', { n: r.messages, c: r.catalogSize })
-                  if (r.suspects && r.suspects.length > 0) inputText += ' · ' + t('suspects', { list: r.suspects.join('、') })
-                  lines.push(h('li', { key: i + '-d', className: 'hl-mut', style: { paddingLeft: '52px', fontSize: '11px' } }, inputText.slice(0, 140)))
-                }
-                if (r.detail) lines.push(h('li', { key: i + '-e', className: 'hl-err', style: { paddingLeft: '52px', fontSize: '11px' } }, String(r.detail).slice(0, 140)))
-                return lines
-              }).reduce(function (a, b) { return a.concat(b) }, []))
-              : h('div', { className: 'hl-mut' }, t('timelineEmpty'))))
+        )
       }
     }
 
