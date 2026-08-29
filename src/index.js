@@ -346,8 +346,16 @@ module.exports = {
     let settingsScope = null
     const schema = settingsSchema()
     if (schema && ctx.settings && typeof ctx.settings.register === 'function') {
-      try { settingsScope = ctx.settings.register('hermes-loop', schema, { base: { ...DEFAULTS, ...config } }) }
-      catch (e) { ctx.logger.warn(`hermes-loop: settings register: ${e && e.message}`) }
+      try {
+        settingsScope = ctx.settings.register('hermes-loop', schema, { base: { ...DEFAULTS, ...config } })
+        trace('settings-registered', {})
+      }
+      catch (e) {
+        trace('settings-register-failed', { message: String(e && e.message || e) })
+        ctx.logger.warn(`hermes-loop: settings register: ${e && e.message}`)
+      }
+    } else {
+      trace('settings-register-skipped', { schema: Boolean(schema), settingsType: typeof ctx.settings })
     }
 
     const effective = () => {
