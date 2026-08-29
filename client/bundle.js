@@ -39,7 +39,8 @@ window.__ModuleLoader__.load({
         'usage.last': '最近使用',
         'usage.status': '状态',
         'usage.modelVisible': '模型可见',
-        'usage.modelDisabled': '已降级',
+        'usage.modelDisabled': '已隐藏',
+        'usage.statusHelp': '状态说明——模型可见：技能会注入到每个对话的技能目录，模型可用 skill 工具加载它；已隐藏：技能标记了 disable-model-invocation，保留在库里但不再注入目录；横杠（—）：调用列的横杠表示从未被模型调用过，状态列的横杠表示该技能当前不在模型目录里（可能已被隐藏或卸载）。',
         'usage.summary': '总调用 {n} 次 · 目录曝光 {c} 条 · 其中 {z} 条从未被调用',
         'usage.empty': '还没有技能调用记录 —— 模型通过 skill 工具加载技能时会在这里计数',
         'written.tab.session': '本对话',
@@ -83,7 +84,8 @@ window.__ModuleLoader__.load({
         'usage.last': 'last used',
         'usage.status': 'status',
         'usage.modelVisible': 'model-visible',
-        'usage.modelDisabled': 'demoted',
+        'usage.modelDisabled': 'hidden',
+        'usage.statusHelp': 'Status legend — model-visible: injected into every conversation catalog, loadable via the skill tool; hidden: marked disable-model-invocation, kept in the library but not injected; dash (—): in the calls column it means never invoked by the model, in the status column it means the skill is not in the current model catalog.',
         'usage.summary': '{n} calls total · {c} catalog entries · {z} never invoked',
         'usage.empty': 'No usage yet — counts land here when the model loads a skill',
         'written.tab.session': 'This session',
@@ -134,6 +136,7 @@ window.__ModuleLoader__.load({
       '.hl-table th{opacity:.55;text-align:left;font-weight:500;padding:2px 8px 4px 0}',
       '.hl-table td{padding:3px 8px 3px 0;border-top:1px solid var(--dsw-alias-border-l3,rgba(128,128,128,.15));font-variant-numeric:tabular-nums}',
       '.hl-scroll{max-height:260px;overflow:auto}',
+      '.hl-help{display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.35));border-radius:50%;font-size:10px;opacity:.6;cursor:help;vertical-align:middle}',
     ].join('')
 
     var fmtTime = function (iso) {
@@ -320,14 +323,15 @@ window.__ModuleLoader__.load({
                         h('th', null, t('tab')),
                         h('th', null, t('usage.calls')),
                         h('th', null, t('usage.last')),
-                        h('th', null, t('usage.status')))),
+                        h('th', null, t('usage.status'), ' ',
+                          h('span', { className: 'hl-help', title: t('usage.statusHelp') }, '?')))),
                       h('tbody', null, u.rows.map(function (row, i) {
                         var zombie = row.count === 0
                         var statusText = row.modelInvocable === undefined ? '—' : (row.modelInvocable ? t('usage.modelVisible') : t('usage.modelDisabled'))
                         return h('tr', { key: i, style: zombie ? { opacity: .6 } : null },
                           h('td', { className: 'hl-skill' }, row.skill),
-                          h('td', null, zombie ? h('span', { className: 'hl-mut' }, '—') : row.count),
-                          h('td', { className: 'hl-mut' }, row.lastUsedAt ? fmtTime(row.lastUsedAt) : '—'),
+                          h('td', null, zombie ? h('span', { className: 'hl-mut', title: t('usage.statusHelp') }, '—') : row.count),
+                          h('td', { className: 'hl-mut' }, row.lastUsedAt ? fmtTime(row.lastUsedAt) : h('span', { title: t('usage.statusHelp') }, '—')),
                           h('td', null, h('span', { className: 'hl-tag' + (row.modelInvocable === false ? ' hl-err' : '') }, statusText)))
                       })))))
                 : h('div', { className: 'hl-mut' }, t('usage.empty')))
