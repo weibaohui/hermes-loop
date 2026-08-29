@@ -498,9 +498,16 @@ module.exports = {
             if (ev.type === 'assistant/message' && ev.data && ev.data.message) {
               const text = contentToText(ev.data.message.content)
               if (text.trim() !== '') finalText = text
-            } else if (ev.type === 'assistant/chunk' && ev.data && ev.data.chunk && ev.data.chunk.type === 'text' && ev.data.chunk.text) {
-              liveText += ev.data.chunk.text
-              if (running !== null && running.sessionId === sessionId) running.preview = liveText.slice(-1200)
+            } else if (ev.type === 'assistant/chunk' && ev.data && ev.data.chunk) {
+              // reasoning-delta 占了 reasoning 模型输出的绝大部分时长——预览里带标记展示，
+              // 否则运行期间卡片几乎总是空白
+              const chunk = ev.data.chunk
+              if (chunk.type === 'text-delta' && chunk.text) {
+                liveText += chunk.text
+                if (running !== null && running.sessionId === sessionId) running.preview = liveText.slice(-1200)
+              } else if (chunk.type === 'reasoning-delta' && chunk.text && (running !== null && running.sessionId === sessionId)) {
+                running.preview = '（推理中）' + chunk.text.slice(-1000)
+              }
             }
           }
         }
