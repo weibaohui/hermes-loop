@@ -133,7 +133,7 @@ window.__ModuleLoader__.load({
       '.hl-err{color:var(--dsw-alias-state-negative,#c75050)}',
       '.hl-mut{opacity:.55}',
       '.hl-table{width:100%;border-collapse:collapse;font-size:12px}',
-      '.hl-table th{opacity:.55;text-align:left;font-weight:500;padding:2px 8px 4px 0}',
+      '.hl-table th{text-align:left;font-weight:500;padding:2px 8px 4px 0;color:var(--dsw-alias-label-secondary,inherit)}',
       '.hl-table td{padding:3px 8px 3px 0;border-top:1px solid var(--dsw-alias-border-l3,rgba(128,128,128,.15));font-variant-numeric:tabular-nums}',
       '.hl-scroll{max-height:260px;overflow:auto}',
       '.hl-help{position:relative;display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.35));border-radius:50%;font-size:10px;color:var(--dsw-alias-label-secondary,inherit);cursor:help;vertical-align:middle}',
