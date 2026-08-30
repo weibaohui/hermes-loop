@@ -567,3 +567,181 @@ test('mergeFrontmatter preserves governance keys (disable-model-invocation etc.)
     assert.match(fresh, /^---\nname: "x"/)
   } finally { await rm(dir, { recursive: true, force: true }) }
 })
+
+// ── Curator: setModelInvocation + curatorTransitions (pure) ─────────────
+
+const { setModelInvocation, curatorTransitions } = plugin.__internals
+
+test('setModelInvocation toggles disable-model-invocation, preserving other keys and body', () => {
+  const base = '---\nname: "s"\ndescription: "d"\nversion: "1"\n---\n\nbody text\n'
+  const off = setModelInvocation(base, false)
+  assert.match(off, /disable-model-invocation: true/)
+  assert.match(off, /version: "1"/)
+  assert.match(off, /body text/)
+  const on = setModelInvocation(off, true)
+  assert.doesNotMatch(on, /disable-model-invocation/)
+  assert.match(on, /version: "1"/)
+  assert.match(on, /body text/)
+  // 无 frontmatter：关=补一块，开=原样
+  assert.match(setModelInvocation('no front', false), /^---\ndisable-model-invocation: true\n---\n\nno front/)
+  assert.equal(setModelInvocation('no front', true), 'no front')
+  // 幂等：重复关不叠加键
+  const offTwice = setModelInvocation(off, false)
+  assert.equal(offTwice.split('disable-model-invocation').length - 1, 1)
+})
+
+test('curatorTransitions: grace / stale / archive / revive / no-auto-unarchive / NaN safety', () => {
+  const NOW = '2026-08-30T00:00:00.000Z'
+  const days = (n) => new Date(Date.parse(NOW) - n * 86400000).toISOString()
+  const opts = { now: NOW, staleDays: 30, archiveDays: 90 }
+  const run = (records, usage = {}) => curatorTransitions(
+    new Map(Object.entries(records)),
+    new Map(Object.entries(usage)),
+    opts)
+  // 零调用且创建不足 30 天 → 宽限，不动
+  assert.equal(run({ 'fresh': { createdAt: days(3), state: 'active' } }).length, 0)
+  // 零调用但创建超过 90 天 → 直接归档（宽限只挡到 stale 线）
+  assert.deepEqual(run({ 'old-virgin': { createdAt: days(100), state: 'active' } }),
+    [{ skill: 'old-virgin', from: 'active', to: 'archived', reason: 'archive' }])
+  // 40 天前用过 → stale（只标记）
+  assert.deepEqual(run({ 'mid': { createdAt: days(100), state: 'active' } }, { mid: { count: 2, lastUsedAt: days(40) } }),
+    [{ skill: 'mid', from: 'active', to: 'stale', reason: 'stale' }])
+  // 已 stale 且仍 40 天 → 无重复转移
+  assert.equal(run({ 'mid': { createdAt: days(100), state: 'stale' } }, { mid: { count: 2, lastUsedAt: days(40) } }).length, 0)
+  // stale 期间又被用到 → 复活
+  assert.deepEqual(run({ 'mid': { createdAt: days(100), state: 'stale' } }, { mid: { count: 3, lastUsedAt: days(1) } }),
+    [{ skill: 'mid', from: 'stale', to: 'active', reason: 'revive' }])
+  // active 且 100 天前用过 → 直接 archived
+  assert.deepEqual(run({ 'dead': { createdAt: days(200), state: 'active' } }, { dead: { count: 5, lastUsedAt: days(100) } }),
+    [{ skill: 'dead', from: 'active', to: 'archived', reason: 'archive' }])
+  // archived 无自动出口——昨天被用过也不复活（恢复只能走 restore 路由）
+  assert.equal(run({ 'dead': { createdAt: days(200), state: 'archived' } }, { dead: { count: 9, lastUsedAt: days(1) } }).length, 0)
+  // lastRestoredAt 顶 anchor：恢复后不会再立刻归档
+  assert.equal(run({ 'dead': { createdAt: days(200), state: 'active', lastRestoredAt: days(1) } }).length, 0)
+  // 坏时间戳 fail-safe：不转移
+  assert.equal(run({ 'broken': { createdAt: 'not-a-date', state: 'active' } }).length, 0)
+})
+
+// ── Curator routes e2e: run → archived + flag flipped; restore → flag removed ──
+
+function postJson(url, obj) {
+  const req = new (require('node:events').EventEmitter)()
+  req.method = 'POST'
+  req.url = url
+  process.nextTick(() => { req.emit('data', Buffer.from(JSON.stringify(obj))); req.emit('end') })
+  return req
+}
+
+test('curator: manual pass archives an aged managed skill (flag flip), restore reverses it', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-curator-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const days = (n) => new Date(Date.now() - n * 86400000).toISOString()
+    // 纳管技能落盘 + usage.json 种子（lastRunAt 置新，避免加载时的惰性 pass 抢先跑）
+    await mkdir(join(home, 'skills', 'old-skill'), { recursive: true })
+    await writeFile(join(home, 'skills', 'old-skill', 'SKILL.md'), '---\nname: "old-skill"\ndescription: "aged"\n---\n\naged body\n')
+    await mkdir(join(home, 'skills', 'mid-skill'), { recursive: true })
+    await writeFile(join(home, 'skills', 'mid-skill', 'SKILL.md'), '---\nname: "mid-skill"\ndescription: "stale-ish"\n---\n\nmid body\n')
+    await mkdir(join(home, 'hermes-loop'), { recursive: true })
+    await writeFile(join(home, 'hermes-loop', 'usage.json'), JSON.stringify({
+      savedAt: days(0),
+      usage: {
+        'old-skill': { count: 3, lastUsedAt: days(100) },
+        'mid-skill': { count: 2, lastUsedAt: days(40) },
+      },
+      catalog: {},
+      curator: {
+        lastRunAt: days(0), runCount: 1, lastSummary: 'seed',
+        skills: {
+          'old-skill': { createdAt: days(200), state: 'active' },
+          'mid-skill': { createdAt: days(200), state: 'active' },
+        },
+      },
+    }))
+    const services = fakeServices('```json\n{"action":"nothing"}\n```')
+    const t = setupPlugin({}, services)
+    await new Promise((r) => setTimeout(r, 50)) // usageLoaded
+    const route = t.routes[0]
+
+    // 巡检：old → archived（文件翻键），mid → stale（文件不动）
+    const runRes = fakeRes()
+    await route.handler(postJson('/hermes-loop/api/curator/run', {}), runRes)
+    assert.equal(runRes.statusCode, 200)
+    const report = JSON.parse(runRes.body).report
+    assert.deepEqual(report.transitions.map((x) => [x.skill, x.to]).sort(),
+      [['mid-skill', 'stale'], ['old-skill', 'archived']])
+    assert.match(await readFile(join(home, 'skills', 'old-skill', 'SKILL.md'), 'utf8'), /disable-model-invocation: true/)
+    assert.doesNotMatch(await readFile(join(home, 'skills', 'mid-skill', 'SKILL.md'), 'utf8'), /disable-model-invocation/)
+
+    // status 快照透出状态与计数
+    const statusRes = fakeRes()
+    await route.handler({ method: 'GET', url: '/hermes-loop/api/status?sessionId=' }, statusRes)
+    const curator = JSON.parse(statusRes.body).curator
+    assert.equal(curator.counts.archived, 1)
+    assert.equal(curator.counts.stale, 1)
+    assert.equal(curator.skills.find((r) => r.skill === 'old-skill').state, 'archived')
+
+    // 恢复：移除治理键 + 状态回 active + lastRestoredAt 顶住再归档
+    const restoreRes = fakeRes()
+    await route.handler(postJson('/hermes-loop/api/curator/restore', { name: 'old-skill' }), restoreRes)
+    assert.equal(restoreRes.statusCode, 200)
+    assert.doesNotMatch(await readFile(join(home, 'skills', 'old-skill', 'SKILL.md'), 'utf8'), /disable-model-invocation/)
+    const rerunRes = fakeRes()
+    await route.handler(postJson('/hermes-loop/api/curator/run', {}), rerunRes)
+    assert.equal(JSON.parse(rerunRes.body).report.transitions.length, 0, 'restored skill must not re-archive next pass')
+
+    // 错误路径：非纳管 404，非归档 400，坏名字 400
+    const unknown = fakeRes()
+    await route.handler(postJson('/hermes-loop/api/curator/restore', { name: 'ghost' }), unknown)
+    assert.equal(unknown.statusCode, 404)
+    const notArchived = fakeRes()
+    await route.handler(postJson('/hermes-loop/api/curator/restore', { name: 'old-skill' }), notArchived)
+    assert.equal(notArchived.statusCode, 400)
+    const badName = fakeRes()
+    await route.handler(postJson('/hermes-loop/api/curator/restore', { name: 'Bad Name' }), badName)
+    assert.equal(badName.statusCode, 400)
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('curator: disabled setting skips the pass; created conclusions get registered as managed', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-curator2-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const services = fakeServices('```json\n{"action":"nothing"}\n```')
+    const t = setupPlugin({ curatorEnabled: false }, services)
+    await new Promise((r) => setTimeout(r, 30))
+    const route = t.routes[0]
+    const runRes = fakeRes()
+    await route.handler(postJson('/hermes-loop/api/curator/run', {}), runRes)
+    assert.equal(JSON.parse(runRes.body).report.skipped, 'disabled')
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+
+  const home2 = await mkdtemp(join(tmpdir(), 'hermes-loop-curator3-'))
+  process.env.DSH_HOME = home2
+  try {
+    const conclusion = JSON.stringify({ action: 'create', skill: 'curator-e2e', description: 'd', body: 'b' })
+    const services = fakeServices('```json\n' + conclusion + '\n```')
+    const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, services)
+    const session = { id: 'session-cur', header: {}, deriveMessages: () => [] }
+    t.fire(session, completedTurn)
+    await new Promise((r) => setTimeout(r, 120))
+    const statusRes = fakeRes()
+    await t.routes[0].handler({ method: 'GET', url: '/hermes-loop/api/status?sessionId=' }, statusRes)
+    const row = JSON.parse(statusRes.body).curator.skills.find((r) => r.skill === 'curator-e2e')
+    assert.ok(row, 'created skill must enter the managed set')
+    assert.equal(row.state, 'active')
+  } finally {
+    process.env.DSH_HOME = oldHome
+    await rm(home2, { recursive: true, force: true })
+  }
+})

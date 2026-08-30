@@ -193,6 +193,11 @@ hermes-loop:
   maxTranscriptChars: 12000
   reviewTimeoutSec: 300
   catalogDescriptionMax: 500   # 对齐 dsh 目录渲染截断
+  # ── Curator（§10，v0.3）──
+  curatorEnabled: true
+  curatorStaleDays: 30
+  curatorArchiveDays: 90
+  curatorIntervalHours: 24
 ```
 
 ## 8. 风险与残余问题
@@ -213,4 +218,75 @@ hermes-loop:
   - **技能使用统计**：tool/call 按技能计数 + skill-catalog 曝光计数，usage.json 持久化，面板统计卡（d821532）——僵尸识别（曝光多零调用）为 Curator 供数；
   - **可见性治理**：采用原生 frontmatter 键 `disable-model-invocation`（公开契约，docs/subsystems/skills.md）；patch 写入保留未知键（mergeFrontmatter）；skills-management 详情页开关 + 卡片"已隐藏"标记/隐藏按钮；usage 表状态列 + 悬停图例（98beaeb→d5e4040）；
   - **附带修复**：市场库存 6600+ 条不再灌入模型目录（skills-management 49c3a41）；settings 迁移 schemastery + 命名空间合规（token 持久化修复，58e7231/c27bddb）。
-- **v0.3（防碎片化）**：~~疑似相关 skill 全文注入~~（提前至 v0.1 完成）；Curator 定时 pass（stale 标记、归档不删除）；信号加速触发（失败率/纠正词表）。候选新增：**memory 通道**（dsh 无原生 memory 机制；Hermes 原版 review 本就 memory+skill 合体，触发/守卫全复用；待出设计补充——载体 `~/.dsh/memory/MEMORY.md`、双结论协议、systemPrompt 注入）。
+- **v0.3（防碎片化）**：~~疑似相关 skill 全文注入~~（提前至 v0.1 完成）；**Curator 纯代码退休 pass ✅（设计见 §10）**——墙钟差值 + 惰性求值的三态状态机（active↔stale→archived；归档=翻 `disable-model-invocation`，永不删除）；信号加速触发（失败率/纠正词表）。候选新增：**memory 通道**（dsh 无原生 memory 机制；Hermes 原版 review 本就 memory+skill 合体，触发/守卫全复用；待出设计补充——载体 `~/.dsh/memory/MEMORY.md`、双结论协议、systemPrompt 注入）。
+
+## 10. Curator 设计（v0.3 补充，2026-08-29）
+
+> 范围：hermes-loop 自己写入（`created`）的 skill。纯代码状态机，无 LLM pass；Hermes 原版的伞形合并（consolidate）本身就是默认关闭的 opt-in，同样不进本期（见 §10.7）。
+
+### 10.1 原理（对齐 agent/curator.py，分析见 research-hermes.md §6）
+
+复盘回路的哲学是"主动倾向"——每轮尽量沉淀，长此以往必然产生碎片。Curator 是配重的"减法"：按最后使用时间跑三态状态机 `active ↔ stale → archived`，**只归档永不删除**（"Archiving is the maximum destructive action"）。原版参数：stale 30 天 / 归档 90 天 / 巡检间隔 168 小时；pinned 与 cron 引用的技能豁免。
+
+### 10.2 时间问题：墙钟差值 + 惰性求值（与原版的核心差异）
+
+"距最后使用 ≥ N 天"是 `now − lastUsedAt` 的**墙钟差值——时间流逝不依赖进程存活**。必须持久化的只有事件时间戳（v0.2 的 usage.json 已按技能记录 `lastUsedAt`），评估改为惰性触发：
+
+| 触发点 | 作用 |
+|---|---|
+| usage.json 加载完成后（apply 内） | 主路径：停机期间"到期"的转移在这里补齐 |
+| 每次 skill 使用事件 | 用到即复活：stale → active（反正要写统计） |
+| 面板"立即巡检"按钮 | POST /api/curator/run，等价 `hermes curator run` |
+| setInterval（12h） | 加速器；距上次巡检不足 intervalHours 则跳过。正确性不依赖它 |
+
+残余缺口是**事件覆盖率不是时间正确性**：插件未加载的窗口内发生的 skill 调用看不见，停机期间被用过的技能可能被误判。缓解按成本排序：① anchor 兜底 + 零调用宽限（§10.3 规则 1）；② 归档只是翻 `disable-model-invocation`，破坏性为零且面板一键可恢复；③ （后续可选）加载时经 sessions 服务回读停机窗口内的 tool/call 回填 lastUsedAt——取决于 sessions API 的查询能力，本期不做。
+
+### 10.3 状态机（纯函数，单测覆盖）
+
+**纳管集**：dispatch 侧 `applyConclusion` 返回 `created` 时登记（`patch` 的目标是既有技能，归属不明不纳管）。记录持久化在 usage.json 的 `curator` 节：`skills: { <name>: { createdAt, state, lastRestoredAt? } }`；使用数据（count/lastUsedAt）仍在同文件 `usage` 节，不重复存。
+
+对每个纳管技能（staleCutoff = now − staleDays，archiveCutoff = now − archiveDays）：
+
+```
+anchor    = max(usage.lastUsedAt, lastRestoredAt, createdAt)  // 恢复也算一次"活动"
+neverUsed = !(usage[name]?.count > 0)
+1. neverUsed && anchor > staleCutoff → 不动（"没用过"是证据缺失，不是过时证据；若状态为 stale 则回 active）
+2. anchor ≤ archiveCutoff && state ≠ archived → archived
+3. anchor ≤ staleCutoff && state = active → stale
+4. anchor > staleCutoff && state = stale → active（复活）
+5. archived 无自动出口——恢复只能走面板（归档件对模型不可见，不会被调用，没有自愈路径）
+```
+
+状态动作：
+
+- **stale**：仅状态标记（面板黄标），文件不动、仍模型可见——先观察一个周期再动手；
+- **archived**：翻 SKILL.md frontmatter `disable-model-invocation: true`（复用 skills-management 已验证的 setModelInvocable 语义：false=移除键、其余键原样保留、临时文件+rename 原子写）。宿主 Chokidar 盯着技能根目录，**外部进程的改写也会触发 skills/change 失效**（docs/subsystems/skills.md:81）——无需调用任何 invalidate，与 v0.1 写入新技能立即可见是同一条通路；
+- **恢复**：state → active + 移除治理键 + 记 `lastRestoredAt`（把 anchor 提到恢复时刻，防止下一轮巡检立即再归档）；
+- 技能文件已不存在（用户手删）→ 移出纳管集。
+
+### 10.4 崩溃安全（对齐原版）
+
+巡检**先**落盘 `lastRunAt`（崩在半路也不会重启后反复重跑，curator.py:1594 同款纪律）→ 逐技能应用（单技能失败不中断整轮）→ 落盘终态 + 一行摘要。usage.json 全程原子写。
+
+### 10.5 配置与 API
+
+```yaml
+curatorEnabled: true      # 总开关
+curatorStaleDays: 30
+curatorArchiveDays: 90
+curatorIntervalHours: 24  # 自动巡检的最小间隔；手动按钮不受限
+```
+
+- status 快照新增 `curator` 节：`{ enabled, staleDays, archiveDays, lastRunAt, runCount, lastSummary, skills: [{ skill, state, createdAt, useCount, lastUsedAt, modelInvocable }] }`；
+- `POST /hermes-loop/api/curator/run` → 立即巡检，返回本次转移报告；
+- `POST /hermes-loop/api/curator/restore { name }` → 归档恢复。
+
+### 10.6 面板
+
+使用统计卡之后新增"技能库维护（Curator）"卡：摘要行（上次巡检时间/各状态计数）、"立即巡检"按钮、纳管技能表（状态徽标、调用数、最后使用；archived 行带"恢复"按钮）。
+
+### 10.7 明确不做
+
+- **LLM 伞形合并**（MERGE INTO UMBRELLA / DEMOTE TO references）：原版默认关闭；等纯代码退休跑稳、纳管集出现真实碎片后再评估；
+- **tar.gz 全量快照**：原版做快照是因为它有 LLM pass 可以大面积重写文件；我们的归档动作完全可逆（翻键 + 面板恢复），无破坏性，不需要回滚介质；
+- **pinned/豁免清单**：纳管集本身就只有自写技能，范围已最小化。

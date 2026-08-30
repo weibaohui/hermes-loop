@@ -74,6 +74,11 @@ const DEFAULTS = {
   catalogDescriptionMax: 500,
   suspectsTopN: 3,
   maxTranscriptMessages: TRANSCRIPT_MESSAGE_CAP,
+  // ── Curator（design §10，v0.3）：纳管集只含本插件 created 的技能 ──
+  curatorEnabled: true,
+  curatorStaleDays: 30,
+  curatorArchiveDays: 90,
+  curatorIntervalHours: 24,
 }
 
 function settingsSchema() {
@@ -91,6 +96,10 @@ function settingsSchema() {
     catalogDescriptionMax: Schema.number().min(50).default(500),
     suspectsTopN: Schema.number().min(0).max(10).default(3),
     maxTranscriptMessages: Schema.number().min(5).max(400).default(40),
+    curatorEnabled: Schema.boolean().default(true),
+    curatorStaleDays: Schema.number().min(1).default(30),
+    curatorArchiveDays: Schema.number().min(2).default(90),
+    curatorIntervalHours: Schema.number().min(1).default(24),
   })
 }
 
@@ -311,6 +320,76 @@ async function atomicWrite(targetFile, content) {
   await fsP.rename(temp, targetFile)
 }
 
+/**
+ * 切换 dsh 原生治理键 `disable-model-invocation`（Curator 归档/恢复的动作面，
+ * design §10.3）。语义与 skills-management 已验证的 setModelInvocable 一致：
+ * modelInvocable=false 写入 `disable-model-invocation: true`；true 移除该键；
+ * 其余 frontmatter 键与正文原样保留。宿主 Chokidar 盯着技能根目录，外部进程
+ * 改写会自动触发 skills/change 失效——无需任何 invalidate 调用。
+ */
+function setModelInvocation(content, modelInvocable) {
+  const lines = String(content || '').split(/\r?\n/)
+  if (lines[0] === undefined || lines[0].trim() !== '---') {
+    return modelInvocable ? content : `---\ndisable-model-invocation: true\n---\n\n${content}`
+  }
+  let closer = -1
+  for (let i = 1; i < lines.length; i += 1) {
+    if (lines[i].trim() === '---') { closer = i; break }
+  }
+  if (closer === -1) return content
+  let kept = lines.slice(1, closer).filter((l) => !/^disable-model-invocation\s*:/.test(l.trim()))
+  if (!modelInvocable) kept = [...kept, 'disable-model-invocation: true']
+  return [...lines.slice(0, 1), ...kept, ...lines.slice(closer)].join('\n')
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000
+
+/**
+ * Curator 纯代码状态机（design §10.3，对齐 hermes curator.apply_automatic_transitions）。
+ * 输入纳管记录与使用统计，返回需要变更的转移计划——不做任何 I/O，便于单测。
+ * 规则（staleCutoff/archiveCutoff 为墙钟差值：时间流逝不依赖进程存活）：
+ *   anchor = max(usage.lastUsedAt, lastRestoredAt, createdAt)  // 恢复也算一次活动
+ *   1 零调用且 anchor 新于 stale 线 → 不动（"没用过"是证据缺失，不是过时证据）；
+ *     若已标 stale 则回 active
+ *   2 anchor ≤ archive 线 → archived（唯一会动文件的转移）
+ *   3 anchor ≤ stale 线 且 active → stale（仅标记，文件不动）
+ *   4 anchor 新于 stale 线 且 stale → active（用到即复活）
+ *   5 archived 无自动出口——恢复只能走 restore 路由（面板）
+ * 坏时间戳（NaN）fail-safe：不做任何转移。
+ */
+function curatorTransitions(records, usage, { now, staleDays, archiveDays }) {
+  const nowMs = Date.parse(now)
+  const staleCutoff = nowMs - staleDays * DAY_MS
+  const archiveCutoff = nowMs - archiveDays * DAY_MS
+  const transitions = []
+  for (const [name, rec] of records) {
+    const u = usage.get(name)
+    const useCount = u && typeof u.count === 'number' ? u.count : 0
+    // anchor = 三个锚点时间里的最新者：最后使用 / 面板恢复 / 创建。
+    // 恢复也算一次"活动"——否则归档时残留的旧 lastUsedAt 会让下轮立即再归档。
+    const anchors = [u && u.lastUsedAt, rec.lastRestoredAt, rec.createdAt]
+      .map((ts) => (typeof ts === 'string' ? Date.parse(ts) : NaN))
+      .filter((ms) => !Number.isNaN(ms))
+    if (anchors.length === 0) continue
+    const anchor = Math.max(...anchors)
+    const state = rec.state === 'stale' || rec.state === 'archived' ? rec.state : 'active'
+    if (useCount === 0 && anchor > staleCutoff) {
+      if (state === 'stale') transitions.push({ skill: name, from: state, to: 'active', reason: 'grace' })
+      continue
+    }
+    if (anchor <= archiveCutoff) {
+      if (state !== 'archived') transitions.push({ skill: name, from: state, to: 'archived', reason: 'archive' })
+      continue
+    }
+    if (anchor <= staleCutoff) {
+      if (state === 'active') transitions.push({ skill: name, from: state, to: 'stale', reason: 'stale' })
+      continue
+    }
+    if (state === 'stale') transitions.push({ skill: name, from: state, to: 'active', reason: 'revive' })
+  }
+  return transitions
+}
+
 // ── Review prompt (ported from Hermes _SKILL_REVIEW_PROMPT, design §4) ──
 
 function reviewPrompt() {
@@ -373,6 +452,7 @@ module.exports = {
     reasonKind, contentToText, renderTranscript, tokenize, rankSuspects,
     extractFencedJson, parseConclusion, sha256, buildSkillMd, mergeFrontmatter, applyConclusion,
     descriptionOf, atomicWrite, DEFAULTS, dshHome, globalSkillsDir, pendingDir,
+    setModelInvocation, curatorTransitions,
   },
 
   apply(ctx, config = {}) {
@@ -438,27 +518,131 @@ module.exports = {
 
     const activityFile = () => join(dshHome(), 'hermes-loop', 'activity.jsonl')
 
-    // ── 技能使用统计（Curator stale 判定的地基）──
+    // ── 技能使用统计 + Curator 状态（同一持久化文件）──
     // usage: 模型经 skill 工具的真实调用；catalogSeen: 出现在目录消息里的曝光。
-    // "曝光多次但调用为零" 即僵尸候选。持久化到 usage.json（防抖 5s + dispose 冲洗）。
+    // "曝光多次但调用为零" 即僵尸候选。curator: 纳管集（本插件 created 的技能）
+    // 与巡检元数据（design §10.3/§10.4）。防抖 5s + dispose 冲洗。
     const usageFile = () => join(dshHome(), 'hermes-loop', 'usage.json')
     const usage = new Map()
     const catalogSeen = new Map()
+    const curatorSkills = new Map() // name → { createdAt, state: active|stale|archived, lastRestoredAt? }
+    const curatorMeta = { lastRunAt: undefined, runCount: 0, lastSummary: undefined }
     let usageFlushTimer = null
-    fsP.readFile(usageFile(), 'utf8').then((raw) => {
+    const usageLoaded = fsP.readFile(usageFile(), 'utf8').then((raw) => {
       const parsed = JSON.parse(raw)
       for (const [name, u] of Object.entries(parsed.usage || {})) usage.set(name, u)
       for (const [name, c] of Object.entries(parsed.catalog || {})) catalogSeen.set(name, c)
+      for (const [name, rec] of Object.entries((parsed.curator && parsed.curator.skills) || {})) curatorSkills.set(name, rec)
+      Object.assign(curatorMeta, parsed.curator || {})
+      delete curatorMeta.skills
     }).catch(() => {})
     const flushUsage = () => {
-      const payload = JSON.stringify({ savedAt: new Date().toISOString(), usage: Object.fromEntries(usage), catalog: Object.fromEntries(catalogSeen) }, null, 2)
-      atomicWrite(usageFile(), payload).catch(() => {})
+      const write = atomicWrite(usageFile(), JSON.stringify({
+        savedAt: new Date().toISOString(),
+        usage: Object.fromEntries(usage),
+        catalog: Object.fromEntries(catalogSeen),
+        curator: { ...curatorMeta, skills: Object.fromEntries(curatorSkills) },
+      }, null, 2))
+      write.catch(() => {}) // fire-and-forget 调用点不产生 unhandled rejection；await 方仍能看到失败
+      return write
     }
     const scheduleUsageFlush = () => {
       if (usageFlushTimer !== null) return
       usageFlushTimer = setTimeout(() => { usageFlushTimer = null; flushUsage() }, 5000)
       if (typeof usageFlushTimer.unref === 'function') usageFlushTimer.unref()
     }
+
+    // ── Curator（design §10）：纳管登记 → 巡检 pass → 归档恢复 ──
+    // 纳管集只含本插件 created 的技能（patch 的目标归属不明，不纳管）。
+    const registerManaged = (name) => {
+      if (curatorSkills.has(name)) return
+      curatorSkills.set(name, { createdAt: new Date().toISOString(), state: 'active' })
+      scheduleUsageFlush()
+      trace('curator-managed', { skill: name })
+    }
+
+    const curatorCounts = () => {
+      const counts = { active: 0, stale: 0, archived: 0 }
+      for (const rec of curatorSkills.values()) {
+        const state = rec.state === 'stale' || rec.state === 'archived' ? rec.state : 'active'
+        counts[state] += 1
+      }
+      return counts
+    }
+
+    /**
+     * 巡检 pass：纯代码状态机，唯一的文件动作是归档时翻 disable-model-invocation。
+     * 崩溃安全（§10.4）：动任何文件之前先落盘 lastRunAt——崩在半路不会重启后反复重跑。
+     */
+    const runCuratorPass = async (manual = false) => {
+      await usageLoaded
+      const eff = effective()
+      if (!eff.curatorEnabled) return { skipped: 'disabled' }
+      if (!manual) {
+        if (curatorMeta.lastRunAt === undefined) {
+          // 首次运行：播种 lastRunAt，等满一个 interval（curator.py should_run_now 同款纪律）
+          curatorMeta.lastRunAt = new Date().toISOString()
+          try { await flushUsage() } catch {}
+          return { skipped: 'seeded' }
+        }
+        if (Date.now() - Date.parse(curatorMeta.lastRunAt) < eff.curatorIntervalHours * 3600 * 1000) return { skipped: 'interval' }
+      }
+      curatorMeta.lastRunAt = new Date().toISOString()
+      curatorMeta.runCount += 1
+      try { await flushUsage() } catch {}
+      const transitions = curatorTransitions(curatorSkills, usage, {
+        now: curatorMeta.lastRunAt,
+        staleDays: eff.curatorStaleDays,
+        archiveDays: eff.curatorArchiveDays,
+      })
+      const applied = []
+      for (const t of transitions) {
+        try {
+          if (t.to === 'archived') {
+            const file = join(globalSkillsDir(), t.skill, 'SKILL.md')
+            let content
+            try { content = await fsP.readFile(file, 'utf8') }
+            catch { curatorSkills.delete(t.skill); applied.push({ ...t, note: 'file-missing-dropped' }); continue }
+            await atomicWrite(file, setModelInvocation(content, false))
+          }
+          curatorSkills.get(t.skill).state = t.to
+          applied.push(t)
+        } catch (e) { applied.push({ ...t, error: String(e && e.message || e) }) }
+      }
+      const counts = curatorCounts()
+      const byTo = (to) => applied.filter((t) => t.to === to).length
+      curatorMeta.lastSummary = `checked ${curatorSkills.size}: +${byTo('stale')} stale, +${byTo('archived')} archived, ${byTo('active')} back to active`
+      try { await flushUsage() } catch {}
+      trace('curator-run', { manual, summary: curatorMeta.lastSummary, applied })
+      ctx.logger.info && ctx.logger.info(`hermes-loop: curator pass — ${curatorMeta.lastSummary}`)
+      return { at: curatorMeta.lastRunAt, checked: curatorSkills.size, transitions: applied, counts, summary: curatorMeta.lastSummary }
+    }
+
+    /** 归档恢复：移除治理键 + state 回 active；lastRestoredAt 把 anchor 提到恢复时刻（防下轮立即再归档）。 */
+    const restoreManaged = async (name) => {
+      const rec = curatorSkills.get(name)
+      if (rec === undefined) return { status: 404, message: `'${name}' is not managed by hermes-loop` }
+      if (rec.state !== 'archived') return { status: 400, message: `'${name}' is not archived (state=${rec.state})` }
+      let note
+      try {
+        const file = join(globalSkillsDir(), name, 'SKILL.md')
+        await atomicWrite(file, setModelInvocation(await fsP.readFile(file, 'utf8'), true))
+      } catch { note = 'file missing; record restored only' }
+      rec.state = 'active'
+      rec.lastRestoredAt = new Date().toISOString()
+      try { await flushUsage() } catch {}
+      trace('curator-restore', { skill: name, note })
+      return { ok: true, note }
+    }
+
+    // 惰性触发主路径（§10.2）：状态加载完成后补一轮停机期间到期的转移；
+    // 12h 定时器只是进程存活期间的加速器——正确性不依赖它（差值是墙钟算的）。
+    usageLoaded.then(() => { runCuratorPass(false).catch(() => {}) })
+    ctx.effect(() => {
+      const timer = setInterval(() => { runCuratorPass(false).catch(() => {}) }, 12 * 60 * 60 * 1000)
+      if (typeof timer.unref === 'function') timer.unref()
+      return () => clearInterval(timer)
+    }, 'hermes-loop: curator interval')
 
     const stateFor = (sessionId) => {
       let st = windows.get(sessionId)
@@ -640,6 +824,7 @@ module.exports = {
       trace('write-outcome', { sessionId, skill: conclusion.skill, ...outcome })
       if (outcome.result === 'created' || outcome.result === 'patched') {
         ctx.logger.info(`${logHead} — ${outcome.result} → ${outcome.path}`)
+        if (outcome.result === 'created') registerManaged(conclusion.skill) // 进入 Curator 纳管集（§10.3）
         notifySourceSession(session, `后台复盘已${outcome.result === 'created' ? '新建' : '修补'}技能「${conclusion.skill}」，下一个会话即可使用${conclusion.rationale ? `：${conclusion.rationale}` : ''}`)
       } else {
         ctx.logger.warn(`${logHead} — ${outcome.result}. ${outcome.detail || ''}`)
@@ -680,6 +865,12 @@ module.exports = {
                 u.lastUsedAt = new Date().toISOString()
                 u.lastSessionId = sessionId
                 usage.set(args.name, u)
+                // 用到即复活（§10.2 规则 4 的事件时实现）：stale 纳管技能当场回 active
+                const managed = curatorSkills.get(args.name)
+                if (managed !== undefined && managed.state === 'stale') {
+                  managed.state = 'active'
+                  trace('curator-revive', { skill: args.name })
+                }
                 scheduleUsageFlush()
               }
             } catch { /* arguments 非 JSON：跳过计数 */ }
@@ -841,6 +1032,30 @@ module.exports = {
         neverCalled: usageRows.filter((r) => r.count === 0).length,
         rows: usageRows.slice(0, 50),
       }
+      // Curator 面板数据（§10.5）：纳管技能行 = 状态机记录 × 使用统计 × 目录实时可见性
+      const stateRank = { archived: 0, stale: 1, active: 2 }
+      const curatorRows = [...curatorSkills.entries()]
+        .map(([name, rec]) => ({
+          skill: name,
+          state: rec.state === 'stale' || rec.state === 'archived' ? rec.state : 'active',
+          createdAt: rec.createdAt,
+          lastRestoredAt: rec.lastRestoredAt,
+          useCount: (usage.get(name) || {}).count || 0,
+          lastUsedAt: (usage.get(name) || {}).lastUsedAt,
+          modelInvocable: invocableByName !== null && invocableByName.has(name) ? invocableByName.get(name) : undefined,
+        }))
+        .sort((a, b) => (a.state === b.state ? String(a.skill).localeCompare(b.skill) : stateRank[a.state] - stateRank[b.state]))
+      const curator = {
+        enabled: eff.curatorEnabled,
+        staleDays: eff.curatorStaleDays,
+        archiveDays: eff.curatorArchiveDays,
+        intervalHours: eff.curatorIntervalHours,
+        lastRunAt: curatorMeta.lastRunAt,
+        runCount: curatorMeta.runCount,
+        lastSummary: curatorMeta.lastSummary,
+        counts: curatorCounts(),
+        skills: curatorRows,
+      }
       return {
         settings: eff,
         running: running !== null ? { sessionId: running.sessionId, startedAt: runningSince, preview: running.preview } : null,
@@ -851,6 +1066,7 @@ module.exports = {
         reviews: reviews.reverse(),
         written,
         usage: usageStats,
+        curator,
       }
     }
 
@@ -899,6 +1115,21 @@ module.exports = {
                 }
                 trace('manual-review-requested', { sessionId, queued: running !== null })
                 sendJson(res, 202, { ok: true, state: running !== null ? 'queued' : 'started' })
+                return
+              }
+              // Curator（§10.5）：立即巡检，绕过 interval 限制
+              if (req.method === 'POST' && apiPath.endsWith('/hermes-loop/api/curator/run')) {
+                const report = await runCuratorPass(true)
+                sendJson(res, 200, { ok: true, report })
+                return
+              }
+              // Curator：归档恢复（移除 disable-model-invocation + anchor 提到恢复时刻）
+              if (req.method === 'POST' && apiPath.endsWith('/hermes-loop/api/curator/restore')) {
+                const body = await readJsonBody(req)
+                if (typeof body.name !== 'string' || !KEbab_NAME_RE.test(body.name)) { sendJson(res, 400, { error: 'body must provide a kebab-case skill name' }); return }
+                const out = await restoreManaged(body.name)
+                if (out.status !== undefined) { sendJson(res, out.status, { error: out.message }); return }
+                sendJson(res, 200, out)
                 return
               }
               sendJson(res, 404, { error: 'not found' })

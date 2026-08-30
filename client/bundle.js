@@ -59,6 +59,21 @@ window.__ModuleLoader__.load({
         'action.create': '新建',
         'action.patch': '修补',
         'action.staged': '待审',
+        curator: '技能库维护（Curator）',
+        'curator.run': '立即巡检',
+        'curator.lastRun': '上次巡检',
+        'curator.never': '从未巡检',
+        'curator.counts': '{a} 活跃 · {s} 待退休 · {r} 已归档',
+        'curator.empty': '还没有由本插件创建的技能 —— 巡检只维护复盘沉淀的库，不碰手写/市场技能',
+        'curator.state.active': '活跃',
+        'curator.state.stale': '待退休',
+        'curator.state.archived': '已归档',
+        'curator.restore': '恢复',
+        'curator.restored': '已恢复',
+        'curator.uses': '调用',
+        'curator.lastUsed': '最后使用',
+        'curator.stateHelp': '状态说明——活跃：技能正常注入对话目录；待退休：超过 stale 天数未被调用（仅标记，仍可被模型使用）；已归档：超过归档天数未用，已从模型目录隐藏（文件保留，可随时恢复）。巡检每天自动跑一次，也可点上方按钮立即执行。',
+        'curator.skill': '技能',
       },
       en: {
         tab: 'Hermes Loop',
@@ -104,6 +119,21 @@ window.__ModuleLoader__.load({
         'action.create': 'create',
         'action.patch': 'patch',
         'action.staged': 'staged',
+        curator: 'Skill library maintenance (Curator)',
+        'curator.run': 'Run inspection',
+        'curator.lastRun': 'Last inspection',
+        'curator.never': 'never ran',
+        'curator.counts': '{a} active · {s} stale · {r} archived',
+        'curator.empty': 'No plugin-created skills yet — inspection only maintains skills distilled by reviews, never hand-written or market skills',
+        'curator.state.active': 'active',
+        'curator.state.stale': 'stale',
+        'curator.state.archived': 'archived',
+        'curator.restore': 'Restore',
+        'curator.restored': 'Restored',
+        'curator.uses': 'calls',
+        'curator.lastUsed': 'last used',
+        'curator.stateHelp': 'Status legend — active: injected into conversation catalogs; stale: unused beyond the stale threshold (marker only, still model-usable); archived: unused beyond the archive threshold, hidden from the model catalog (file kept, restorable anytime). Inspection runs daily, or on demand via the button above.',
+        'curator.skill': 'Skill',
       },
     }
 
@@ -145,6 +175,13 @@ window.__ModuleLoader__.load({
       if (!iso) return ''
       var d = new Date(iso)
       return isNaN(d.getTime()) ? '' : ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2) + ':' + ('0' + d.getSeconds()).slice(-2)
+    }
+    // Curator 的时间跨度以天计，纯时分秒没意义
+    var fmtDate = function (iso) {
+      if (!iso) return ''
+      var d = new Date(iso)
+      if (isNaN(d.getTime())) return ''
+      return ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2) + ' ' + ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2)
     }
     var pct = function (v, max) { return max > 0 ? Math.min(100, Math.round(v / max * 100)) : 0 }
 
@@ -207,6 +244,27 @@ window.__ModuleLoader__.load({
             body: JSON.stringify({ sessionId: sessionId || '' }),
           }).then(function (r) { return r.json() })
             .then(function (d) { setManualFlash(d.state || 'started'); setTimeout(function () { setManualFlash(null) }, 2500); setNonce(function (n) { return n + 1 }) })
+            .catch(function () {})
+        }
+
+        var _cur = React.useState(null)
+        var curatorFlash = _cur[0]
+        var setCuratorFlash = _cur[1]
+        var flashCurator = function (text) { setCuratorFlash(text); setTimeout(function () { setCuratorFlash(null) }, 3500) }
+        var curatorRun = function () {
+          fetch('/hermes-loop/api/curator/run', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+            .then(function (r) { return r.json() })
+            .then(function (d) {
+              var rep = d && d.report || {}
+              flashCurator(rep.skipped ? 'skipped: ' + rep.skipped : (rep.summary || t('curator.run')))
+              setNonce(function (n) { return n + 1 })
+            })
+            .catch(function () {})
+        }
+        var restoreSkill = function (name) {
+          fetch('/hermes-loop/api/curator/restore', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: name }) })
+            .then(function (r) { return r.json() })
+            .then(function (d) { flashCurator(d && d.ok ? t('curator.restored') + ': ' + name : (d && d.error || '')); setNonce(function (n) { return n + 1 }) })
             .catch(function () {})
         }
 
@@ -337,6 +395,47 @@ window.__ModuleLoader__.load({
                           h('td', null, h('span', { className: 'hl-tag' + (row.modelInvocable === false ? ' hl-err' : '') }, statusText)))
                       })))))
                 : h('div', { className: 'hl-mut' }, t('usage.empty')))
+          })(),
+
+          // 技能库维护（Curator）：摘要 + 立即巡检 + 纳管技能状态表
+          (function () {
+            var c = data.curator || { skills: [], counts: {} }
+            var counts = c.counts || { active: 0, stale: 0, archived: 0 }
+            var skills = c.skills || []
+            return h('div', { className: 'hl-card' },
+              h('h3', null, t('curator')),
+              h('div', { className: 'hl-row' },
+                h('span', { className: 'hl-mut' },
+                  t('curator.lastRun') + ': ' + (c.lastRunAt ? fmtDate(c.lastRunAt) : t('curator.never'))),
+                h('span', { className: 'hl-mut' },
+                  t('curator.counts', { a: counts.active || 0, s: counts.stale || 0, r: counts.archived || 0 })),
+                h('span', { className: 'hl-help', 'data-tip': t('curator.stateHelp') }, '?'),
+                h('span', { style: { flex: 1 } }),
+                h('button', { className: 'hl-chip', onClick: curatorRun }, t('curator.run')),
+                curatorFlash ? h('span', { className: 'hl-mut' }, curatorFlash) : null),
+              c.lastSummary ? h('div', { className: 'hl-row hl-mut' }, c.lastSummary) : null,
+              skills.length > 0
+                ? h('div', { className: 'hl-scroll' },
+                  h('table', { className: 'hl-table' },
+                    h('thead', null, h('tr', null,
+                      h('th', null, t('curator.skill')),
+                      h('th', null, t('usage.status')),
+                      h('th', null, t('curator.uses')),
+                      h('th', null, t('curator.lastUsed')),
+                      h('th', null, ''))),
+                    h('tbody', null, skills.map(function (row, i) {
+                      return h('tr', { key: i, style: row.state !== 'active' ? { opacity: .75 } : null },
+                        h('td', { className: 'hl-skill' }, row.skill),
+                        h('td', null, h('span', { className: 'hl-tag' + (row.state === 'archived' ? ' hl-err' : '') },
+                          t('curator.state.' + row.state))),
+                        h('td', null, row.useCount),
+                        h('td', { className: 'hl-mut' }, row.lastUsedAt ? fmtDate(row.lastUsedAt) : '—'),
+                        h('td', null,
+                          row.state === 'archived'
+                            ? h('button', { className: 'hl-chip', onClick: function () { restoreSkill(row.skill) } }, t('curator.restore'))
+                            : null))
+                    }))))
+                : h('div', { className: 'hl-mut' }, t('curator.empty')))
           })(),
         )
       }

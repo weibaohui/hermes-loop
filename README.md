@@ -2,9 +2,9 @@
 
 把 [Hermes Agent](https://github.com/NousResearch/hermes-agent) 的 Learning Loop 移植到 dsh：对话收尾后自动复盘，把有价值的经验蒸馏成可复用的 skill。
 
-> ✅ **v0.1 + v0.2 已实现并真实验收**（触发 → 复盘 → 写入 → 可见 → 面板 → 使用统计）。设计文档：[docs/design-dsh.md](docs/design-dsh.md)（v2.1）· [docs/research-hermes.md](docs/research-hermes.md)（Hermes 机制源码级调研）。
+> ✅ **v0.1 + v0.2 + v0.3（Curator）已实现并真实验收**（触发 → 复盘 → 写入 → 可见 → 面板 → 使用统计 → 技能库维护）。设计文档：[docs/design-dsh.md](docs/design-dsh.md)（v2.1 + §10）· [docs/research-hermes.md](docs/research-hermes.md)（Hermes 机制源码级调研）。
 >
-> 功能一览：自动复盘（阈值/冷却/前台优先）+ **手动"立即复盘"按钮**（带运行中实时输出预览）；skill create/patch（CAS 守卫）；auto/approval/log-only 三模式（面板即时切换）；结论回显到来源会话；in-session patch 纪律 section；**技能使用统计**（调用/目录曝光/僵尸识别，面板可视化）；与 skills-management 共享原生的 `disable-model-invocation` 治理键（patch 自动保留）。
+> 功能一览：自动复盘（阈值/冷却/前台优先）+ **手动"立即复盘"按钮**（带运行中实时输出预览）；skill create/patch（CAS 守卫）；auto/approval/log-only 三模式（面板即时切换）；结论回显到来源会话；in-session patch 纪律 section；**技能使用统计**（调用/目录曝光/僵尸识别，面板可视化）；与 skills-management 共享原生的 `disable-model-invocation` 治理键（patch 自动保留）；**Curator 技能库维护**（纳管集=本插件 created 的技能；active↔stale→archived 三态状态机，归档=翻治理键、永不删除、面板可恢复；墙钟差值+惰性求值，插件不常驻也判得准）。
 
 ## 运行机制
 
@@ -46,7 +46,7 @@ chokidar watcher 自动失效 registry → 下一个新会话的 available_skill
 
 安装后需重启 dsh server（宿主插件不热加载）。
 
-## 配置（ctx.settings 命名空间 `hermes-loop`，zod 校验）
+## 配置（ctx.settings 命名空间 `hermes-loop`，schemastery 校验）
 
 | key | 默认 | 说明 |
 |---|---|---|
@@ -60,6 +60,20 @@ chokidar watcher 自动失效 registry → 下一个新会话的 available_skill
 | `reviewTimeoutSec` | `300` | review 硬超时 |
 | `catalogDescriptionMax` | `500` | 目录 description 截断（对齐 dsh 渲染） |
 | `suspectsTopN` | `3` | 注入全文的疑似 skill 数 |
+| `curatorEnabled` | `true` | Curator 巡检总开关 |
+| `curatorStaleDays` | `30` | 纳管技能多少天未用标记"待退休"（仅标记，文件不动） |
+| `curatorArchiveDays` | `90` | 多少天未用归档（翻 `disable-model-invocation` 隐藏出模型目录，可面板恢复） |
+| `curatorIntervalHours` | `24` | 自动巡检最小间隔；面板"立即巡检"按钮不受限 |
+
+## Curator（技能库维护）
+
+复盘的"主动倾向"必然产生碎片，Curator 是配重的减法（对齐 Hermes `agent/curator.py` 的纯代码部分）：
+
+- **纳管集**只含本插件 `created` 的技能（patch 的目标归属不明，不纳管；手写/市场技能永远不碰）；
+- **状态机**（规则见 design §10.3）：`active ↔ stale → archived`。anchor = max（最后使用， 面板恢复， 创建）；零调用且未满 stale 天数的技能享受宽限（"没用过"是证据缺失，不是过时证据）；archived 无自动出口，恢复只能走面板；
+- **归档动作**只是翻 frontmatter `disable-model-invocation: true`——文件保留、永不删除，宿主 chokidar  watcher 自动失效 registry（与写入技能同通路，无需 invalidate）；
+- **时间问题**：状态判定是墙钟差值，持久化的只是事件时间戳（usage.json），插件/服务器停机不影响判断；触发是惰性的（加载时补停机窗口 + 每次使用事件复活 + 面板按钮 + 12h 定时加速器）；
+- API：`POST /hermes-loop/api/curator/run`（立即巡检，返回转移报告）、`POST /hermes-loop/api/curator/restore {name}`（恢复归档件）。
 
 ## 守卫
 
