@@ -50,13 +50,26 @@ const TRANSCRIPT_MESSAGE_CHARS = 4000
  * `$DSH_HOME/hermes-loop/activity.jsonl`. Plugin `ctx.logger` output is
  * filtered by the host's log exporters, so the loop keeps its own record —
  * also the audit ledger for review-triggered writes (design §7).
+ * 滚动截断：账本只增不减会让启动回填（全量扫）和面板轮询（读尾部）随年龄变慢，
+ * 超过 512KB 时保留尾部 2000 行（≈200+ 次复盘的完整记录）。
  */
 function makeTracer() {
   const file = join(dshHome(), 'hermes-loop', 'activity.jsonl')
+  const MAX_BYTES = 512 * 1024
+  const KEEP_LINES = 2000
+  let approxSize = -1 // -1 = 未测量，首次 append 后 stat 校准
   return (event, data = {}) => {
     const line = JSON.stringify({ at: new Date().toISOString(), event, ...data }) + '\n'
     fsP.mkdir(join(file, '..'), { recursive: true })
       .then(() => fsP.appendFile(file, line, 'utf8'))
+      .then(() => {
+        if (approxSize < 0) { approxSize = 0; fsP.stat(file).then((s) => { approxSize = s.size }).catch(() => {}); return }
+        approxSize += line.length
+        if (approxSize <= MAX_BYTES) return
+        approxSize = 0
+        return fsP.readFile(file, 'utf8')
+          .then((raw) => atomicWrite(file, raw.trimEnd().split('\n').slice(-KEEP_LINES).join('\n') + '\n'))
+      })
       .catch(() => {})
   }
 }
@@ -226,8 +239,10 @@ function parseConclusion(text) {
   if (typeof parsed.body !== 'string' || parsed.body.trim() === '' || parsed.body.length > BODY_MAX_CHARS) return undefined
   const conclusion = { action: parsed.action, skill: parsed.skill, body: parsed.body, rationale: typeof parsed.rationale === 'string' ? parsed.rationale : '' }
   if (parsed.action === 'create') {
-    if (typeof parsed.description !== 'string' || parsed.description.trim() === '' || parsed.description.length > DESCRIPTION_MAX) return undefined
-    conclusion.description = parsed.description.trim()
+    if (typeof parsed.description !== 'string' || parsed.description.trim() === '') return undefined
+    // 超长截断而非整体丢弃：模型对字符数的估计与 UTF-16 .length（emoji 算 2）
+    // 有系统性偏差，一条其余全合法的结论不该因 description 略长而蒸发
+    conclusion.description = parsed.description.trim().slice(0, DESCRIPTION_MAX)
   }
   if (parsed.action === 'patch') {
     // CAS inputs — writer re-reads the file and compares (design §6 step ①)
@@ -367,6 +382,40 @@ function matchCorrectionWord(text, words) {
 }
 
 /**
+ * settings 服务缺席时 POST /settings 的回退校验：有 scope 走 schemastery 完整校验，
+ * 没 scope 至少挡住非法枚举与越界数字——裸 Object.assign 会让 mode:'typo' 静默落入
+ * auto 直写分支（与 fail-closed 直觉相反）。
+ */
+function sanitizeSettingsPatch(patch) {
+  if (patch === null || typeof patch !== 'object') return {}
+  const out = {}
+  if (typeof patch.enabled === 'boolean') out.enabled = patch.enabled
+  if (typeof patch.mode === 'string' && ['auto', 'approval', 'log-only'].includes(patch.mode)) out.mode = patch.mode
+  if (typeof patch.provider === 'string') out.provider = patch.provider
+  if (typeof patch.model === 'string') out.model = patch.model
+  const num = (key, min, max) => {
+    const v = patch[key]
+    if (typeof v === 'number' && Number.isFinite(v) && v >= min && (max === undefined || v <= max)) out[key] = v
+  }
+  num('turnInterval', 1)
+  num('toolCallInterval', 0)
+  num('cooldownMinutes', 0)
+  num('maxTranscriptChars', 1000)
+  num('reviewTimeoutSec', 30)
+  num('catalogDescriptionMax', 50)
+  num('suspectsTopN', 0, 10)
+  num('maxTranscriptMessages', 5, 400)
+  if (typeof patch.curatorEnabled === 'boolean') out.curatorEnabled = patch.curatorEnabled
+  num('curatorStaleDays', 1)
+  num('curatorArchiveDays', 2)
+  num('curatorIntervalHours', 1)
+  if (typeof patch.signalTriggerEnabled === 'boolean') out.signalTriggerEnabled = patch.signalTriggerEnabled
+  num('signalToolFailureMin', 0)
+  if (typeof patch.signalCorrectionWords === 'string') out.signalCorrectionWords = patch.signalCorrectionWords
+  return out
+}
+
+/**
  * Curator 纯代码状态机（design §10.3，对齐 hermes curator.apply_automatic_transitions）。
  * 输入纳管记录与使用统计，返回需要变更的转移计划——不做任何 I/O，便于单测。
  * 规则（staleCutoff/archiveCutoff 为墙钟差值：时间流逝不依赖进程存活）：
@@ -474,7 +523,7 @@ module.exports = {
     reasonKind, contentToText, renderTranscript, tokenize, rankSuspects,
     extractFencedJson, parseConclusion, sha256, buildSkillMd, mergeFrontmatter, applyConclusion,
     descriptionOf, atomicWrite, DEFAULTS, dshHome, globalSkillsDir, pendingDir,
-    setModelInvocation, curatorTransitions, parseCorrectionWords, matchCorrectionWord,
+    setModelInvocation, curatorTransitions, parseCorrectionWords, matchCorrectionWord, sanitizeSettingsPatch,
   },
 
   apply(ctx, config = {}) {
@@ -550,22 +599,38 @@ module.exports = {
     const curatorSkills = new Map() // name → { createdAt, state: active|stale|archived, lastRestoredAt? }
     const curatorMeta = { lastRunAt: undefined, runCount: 0, lastSummary: undefined }
     let usageFlushTimer = null
+    let usageReady = false
     const usageLoaded = fsP.readFile(usageFile(), 'utf8').then((raw) => {
       const parsed = JSON.parse(raw)
-      for (const [name, u] of Object.entries(parsed.usage || {})) usage.set(name, u)
-      for (const [name, c] of Object.entries(parsed.catalog || {})) catalogSeen.set(name, c)
-      for (const [name, rec] of Object.entries((parsed.curator && parsed.curator.skills) || {})) curatorSkills.set(name, rec)
+      // 合并而非覆盖：加载窗口内事件可能已经改写过内存（计数/复活/纳管登记）。
+      // 此刻内存里的条目只含本次启动后的增量——计数与磁盘相加，时间戳取新；
+      // curator 记录则是内存态更新（可能刚被复活/登记），磁盘旧值不得盖回
+      for (const [name, u] of Object.entries(parsed.usage || {})) {
+        const mem = usage.get(name)
+        if (mem === undefined) { usage.set(name, u); continue }
+        mem.count = (mem.count || 0) + (u.count || 0)
+        if (typeof u.lastUsedAt === 'string' && (typeof mem.lastUsedAt !== 'string' || Date.parse(u.lastUsedAt) > Date.parse(mem.lastUsedAt))) mem.lastUsedAt = u.lastUsedAt
+      }
+      for (const [name, c] of Object.entries(parsed.catalog || {})) {
+        const mem = catalogSeen.get(name)
+        if (mem === undefined) { catalogSeen.set(name, c); continue }
+        mem.count = (mem.count || 0) + (c.count || 0)
+        if (typeof c.lastAt === 'string' && (typeof mem.lastAt !== 'string' || Date.parse(c.lastAt) > Date.parse(mem.lastAt))) mem.lastAt = c.lastAt
+      }
+      for (const [name, rec] of Object.entries((parsed.curator && parsed.curator.skills) || {})) { if (!curatorSkills.has(name)) curatorSkills.set(name, rec) }
       Object.assign(curatorMeta, parsed.curator || {})
       delete curatorMeta.skills
-    }).catch(() => {})
+    }).catch(() => {}).then(() => { usageReady = true })
     const flushUsage = () => {
+      // 加载完成前绝不写盘——近乎空的内存态会盖掉磁盘上完好的 usage.json
+      if (!usageReady) return Promise.resolve()
       const write = atomicWrite(usageFile(), JSON.stringify({
         savedAt: new Date().toISOString(),
         usage: Object.fromEntries(usage),
         catalog: Object.fromEntries(catalogSeen),
         curator: { ...curatorMeta, skills: Object.fromEntries(curatorSkills) },
       }, null, 2))
-      write.catch(() => {}) // fire-and-forget 调用点不产生 unhandled rejection；await 方仍能看到失败
+      write.catch((e) => trace('usage-flush-failed', { message: String(e && e.message || e) }))
       return write
     }
     const scheduleUsageFlush = () => {
@@ -615,11 +680,17 @@ module.exports = {
       const transitions = curatorTransitions(curatorSkills, usage, {
         now: curatorMeta.lastRunAt,
         staleDays: eff.curatorStaleDays,
-        archiveDays: eff.curatorArchiveDays,
+        // archive 必须晚于 stale：schema 两个 min 各自独立，配置可能倒挂
+        archiveDays: Math.max(eff.curatorArchiveDays, eff.curatorStaleDays + 1),
       })
       const applied = []
       for (const t of transitions) {
         try {
+          const rec = curatorSkills.get(t.skill)
+          if (rec === undefined) continue
+          // 计划与执行之间隔着文件 IO——期间的手动 restore 优先：状态已变就放弃本条
+          const curState = rec.state === 'stale' || rec.state === 'archived' ? rec.state : 'active'
+          if (curState !== t.from) { applied.push({ ...t, note: 'state-changed-skipped' }); continue }
           if (t.to === 'archived') {
             const file = join(globalSkillsDir(), t.skill, 'SKILL.md')
             let content
@@ -627,7 +698,7 @@ module.exports = {
             catch { curatorSkills.delete(t.skill); applied.push({ ...t, note: 'file-missing-dropped' }); continue }
             await atomicWrite(file, setModelInvocation(content, false))
           }
-          curatorSkills.get(t.skill).state = t.to
+          rec.state = t.to
           applied.push(t)
         } catch (e) { applied.push({ ...t, error: String(e && e.message || e) }) }
       }
@@ -642,6 +713,7 @@ module.exports = {
 
     /** 归档恢复：移除治理键 + state 回 active；lastRestoredAt 把 anchor 提到恢复时刻（防下轮立即再归档）。 */
     const restoreManaged = async (name) => {
+      await usageLoaded // 加载窗口内的恢复会被迟到的磁盘旧值盖回——等加载完成
       const rec = curatorSkills.get(name)
       if (rec === undefined) return { status: 404, message: `'${name}' is not managed by hermes-loop` }
       if (rec.state !== 'archived') return { status: 400, message: `'${name}' is not archived (state=${rec.state})` }
@@ -689,14 +761,23 @@ module.exports = {
     backfillManaged()
       .then(() => runCuratorPass(false).catch(() => {}))
     ctx.effect(() => {
-      const timer = setInterval(() => { runCuratorPass(false).catch(() => {}) }, 12 * 60 * 60 * 1000)
+      // 每小时醒一次（巡检间隔由 eff.curatorIntervalHours 门控，不再是硬编码 12h）；
+      // 顺手淘汰 7 天未活动的会话窗口——windows Map 只增不减是长存活宿主上的慢漏
+      const timer = setInterval(() => {
+        runCuratorPass(false).catch(() => {})
+        const cutoff = Date.now() - 7 * DAY_MS
+        for (const [sid, st] of windows) {
+          if ((st.lastSeenAt || 0) < cutoff) windows.delete(sid)
+        }
+      }, 60 * 60 * 1000)
       if (typeof timer.unref === 'function') timer.unref()
       return () => clearInterval(timer)
     }, 'hermes-loop: curator interval')
 
     const stateFor = (sessionId) => {
       let st = windows.get(sessionId)
-      if (st === undefined) windows.set(sessionId, st = { turns: 0, toolCalls: 0, lastReviewAt: 0, failures: 0, signal: undefined })
+      if (st === undefined) windows.set(sessionId, st = { turns: 0, toolCalls: 0, lastReviewAt: 0, failures: 0, signal: undefined, lastSeenAt: 0 })
+      st.lastSeenAt = Date.now()
       return st
     }
 
@@ -712,7 +793,9 @@ module.exports = {
       if (running !== null || queued.size === 0) return
       const [nextSessionId, task] = queued.entries().next().value
       queued.delete(nextSessionId)
-      Promise.resolve().then(task).catch((e) => ctx.logger.warn(`hermes-loop: review task: ${e && e.message}`))
+      // 直接同步调用：running 必须在同一调用栈内置位。隔一个微任务会让并发的
+      // 下一个事件也看到 running===null，串行不变量被击穿
+      task().catch((e) => ctx.logger.warn(`hermes-loop: review task: ${e && e.message}`))
     }
 
     const runReview = async ({ session, eff, manual = false }) => {
@@ -753,14 +836,20 @@ module.exports = {
         const suspects = rankSuspects(catalog, transcriptText).slice(0, eff.suspectsTopN)
         trace('review-inputs', { sessionId, messages: messages.length, catalogSize: catalog.length, suspects: suspects.map((s) => s.name) })
         const suspectBlocks = []
+        const globalRoot = globalSkillsDir() + sep
         for (const suspect of suspects) {
           if (!suspect.resourceBase || suspect.resourceBase.kind !== 'directory' || typeof suspect.resourceBase.path !== 'string') continue
+          // writer 只认全局库（applyConclusion 的 globalDir）——项目级技能注入 baseHash
+          // 也必然 patch-missing，白白误导复盘；不注入
+          if (!resolve(suspect.resourceBase.path).startsWith(globalRoot)) continue
           const file = join(suspect.resourceBase.path, 'SKILL.md')
           let content
           try { content = await fsP.readFile(file, 'utf8') } catch { continue }
           const hash = sha256(content)
           if (content.length > SUSPECT_BODY_MAX_CHARS) content = content.slice(0, SUSPECT_BODY_MAX_CHARS) + '\n…（截断）'
-          suspectBlocks.push(`### suspect: ${suspect.name}\nbaseHash: ${hash}\nbaseDescription: ${JSON.stringify(suspect.description)}\n\n${content}`)
+          // baseDescription 必须取文件全文里的完整值：目录构造时 description 被截断到
+          // catalogDescriptionMax，用截断值做 CAS 基准会让长描述技能永远 cas-conflict
+          suspectBlocks.push(`### suspect: ${suspect.name}\nbaseHash: ${hash}\nbaseDescription: ${JSON.stringify(descriptionOf(content) || '')}\n\n${content}`)
         }
 
         // 3. zero-tool review agent（进程内、独立会话、不污染会话库）
@@ -994,7 +1083,8 @@ module.exports = {
 
         const task = () => runReview({ session, eff })
         if (running === null) {
-          Promise.resolve().then(task).catch((e) => ctx.logger.warn(`hermes-loop: review task: ${e && e.message}`))
+          // 同步直调（running 立即置位），不隔微任务
+          task().catch((e) => ctx.logger.warn(`hermes-loop: review task: ${e && e.message}`))
         } else if (!queued.has(sessionId)) {
           queued.set(sessionId, task)
         } else {
@@ -1010,7 +1100,7 @@ module.exports = {
         queued.clear()
         windows.clear()
         if (usageFlushTimer !== null) { clearTimeout(usageFlushTimer); usageFlushTimer = null }
-        if (usage.size > 0 || catalogSeen.size > 0) flushUsage() // 统计不丢
+        flushUsage() // 无条件冲洗（内部有 usageReady 门）：curator-only 脏态也不能丢
         if (running !== null) running.controller.abort() // runner finally 里 dispose agent
       }
     }, 'hermes-loop: session/event subscription')
@@ -1194,7 +1284,7 @@ module.exports = {
                   return
                 }
                 if (settingsScope && typeof settingsScope.update === 'function') await settingsScope.update(body.patch)
-                else Object.assign(config, body.patch) // 无 settings 服务时退化为运行时覆盖
+                else Object.assign(config, sanitizeSettingsPatch(body.patch)) // 无 settings 服务时的降级路径也要校验
                 sendJson(res, 200, { ok: true, settings: effective() })
                 return
               }
@@ -1211,14 +1301,15 @@ module.exports = {
                   sendJson(res, 200, { ok: true, state: 'already-running' })
                   return
                 }
+                const wasRunning = running !== null
                 const task = () => runReview({ session, eff: effective(), manual: true })
-                if (running === null) {
-                  Promise.resolve().then(task).catch((e) => ctx.logger.warn(`hermes-loop: manual review: ${e && e.message}`))
+                if (!wasRunning) {
+                  task().catch((e) => ctx.logger.warn(`hermes-loop: manual review: ${e && e.message}`)) // 同步直调置 running
                 } else {
                   queued.set(sessionId, task) // 排队（顶替同 session 旧任务），running 结束后 drainNext
                 }
-                trace('manual-review-requested', { sessionId, queued: running !== null })
-                sendJson(res, 202, { ok: true, state: running !== null ? 'queued' : 'started' })
+                trace('manual-review-requested', { sessionId, queued: wasRunning })
+                sendJson(res, 202, { ok: true, state: wasRunning ? 'queued' : 'started' })
                 return
               }
               // Curator（§10.5）：立即巡检，绕过 interval 限制

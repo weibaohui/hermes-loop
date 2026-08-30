@@ -218,6 +218,10 @@ hermes-loop:
   - **技能使用统计**：tool/call 按技能计数 + skill-catalog 曝光计数，usage.json 持久化，面板统计卡（d821532）——僵尸识别（曝光多零调用）为 Curator 供数；
   - **可见性治理**：采用原生 frontmatter 键 `disable-model-invocation`（公开契约，docs/subsystems/skills.md）；patch 写入保留未知键（mergeFrontmatter）；skills-management 详情页开关 + 卡片"已隐藏"标记/隐藏按钮；usage 表状态列 + 悬停图例（98beaeb→d5e4040）；
   - **附带修复**：市场库存 6600+ 条不再灌入模型目录（skills-management 49c3a41）；settings 迁移 schemastery + 命名空间合规（token 持久化修复，58e7231/c27bddb）。
+- **v0.4.1 审查修复轮（2026-08-30，四路并行审查 → 逐条源码验证 → 修复）**：
+  - **P1**：① suspect 的 baseDescription 曾用目录截断值做 CAS 基准——description 超 500 字符的技能永远无法 patch（改从文件全文取完整值）；② usage.json 加载竞态——flush 加 usageReady 门（加载完成前绝不写盘）+ 加载回调改合并语义（计数相加、时间戳取新、curator 记录内存优先）；③ 全局串行队列微任务缺口——三处启动路径改同步直调（running 同调用栈置位）；
+  - **P2**：Curator 巡检应用转移前重查当前状态（手动 restore 优先）+ `archive ≥ stale+1` 运行时钳位；dispose 无条件冲洗；activity.jsonl 超 512KB 滚动截断（保留尾 2000 行）；windows 会话状态 7 天淘汰（随每小时定时器）；巡检定时器 1h 一醒（间隔交给 `curatorIntervalHours` 门控）；项目级技能不再进 suspects（writer 只认全局库，注入必然 patch-missing）；description 超长截断而非丢弃整条结论；settings 缺席时的回退 patch 走 `sanitizeSettingsPatch` 校验（非法 mode 不再静默落入 auto 直写）；
+  - **客户端**：savePatch 检查 HTTP 状态（失败显示"保存失败"而非假"已保存"）；reviewNow 404/错误有可见反馈；usage 表头修正为"技能"；信号徽标 kind 本地化；usage.rows 缺失防御。
 - **v0.3（防碎片化）**：~~疑似相关 skill 全文注入~~（提前至 v0.1 完成）；**Curator 纯代码退休 pass ✅（设计见 §10）**——墙钟差值 + 惰性求值的三态状态机（active↔stale→archived；归档=翻 `disable-model-invocation`，永不删除；纳管事实依据统一为 activity.jsonl 的 write-outcome:created 账本，加载时回填存量）；**信号加速触发 ✅（设计见 §11）**——abort/工具失败突发/纠正词三类信号命中即跳过阈值提前复盘，冷却仍生效，词表面板可改、命中率面板度量。候选新增：**memory 通道**（dsh 无原生 memory 机制；Hermes 原版 review 本就 memory+skill 合体，触发/守卫全复用；待出设计补充——载体 `~/.dsh/memory/MEMORY.md`、双结论协议、systemPrompt 注入）。
 
 ## 10. Curator 设计（v0.3 补充，2026-08-29）

@@ -43,6 +43,7 @@ window.__ModuleLoader__.load({
         'usage.statusHelp': '状态说明——模型可见：技能会注入到每个对话的技能目录，模型可用 skill 工具加载它；已隐藏：技能标记了 disable-model-invocation，保留在库里但不再注入目录；横杠（—）：调用列的横杠表示从未被模型调用过，状态列的横杠表示该技能当前不在模型目录里（可能已被隐藏或卸载）。',
         'usage.summary': '总调用 {n} 次 · 目录曝光 {c} 条 · 其中 {z} 条从未被调用',
         'usage.empty': '还没有技能调用记录 —— 模型通过 skill 工具加载技能时会在这里计数',
+        'usage.skill': '技能',
         'written.tab.session': '本对话',
         'written.tab.plugin': '本插件',
         'written.sessionEmpty': '本对话还没有沉淀 —— 攒够触发阈值后，后台复盘的产物会出现在这里',
@@ -83,6 +84,9 @@ window.__ModuleLoader__.load({
         'signal.stats': '近期信号 {t} 次（中断 {a} · 失败 {f} · 纠正 {c}），触发复盘 {r} 次，产出 {y} 个',
         'signal.none': '近期无加速信号',
         'signal.accelerated': '已加速（{k}），下一个 turn 尾立即复盘',
+        'signal.kind.abort': '中断',
+        'signal.kind.tool-failure': '工具失败',
+        'signal.kind.correction': '纠正词',
       },
       en: {
         tab: 'Hermes Loop',
@@ -112,6 +116,7 @@ window.__ModuleLoader__.load({
         'usage.statusHelp': 'Status legend — model-visible: injected into every conversation catalog, loadable via the skill tool; hidden: marked disable-model-invocation, kept in the library but not injected; dash (—): in the calls column it means never invoked by the model, in the status column it means the skill is not in the current model catalog.',
         'usage.summary': '{n} calls total · {c} catalog entries · {z} never invoked',
         'usage.empty': 'No usage yet — counts land here when the model loads a skill',
+        'usage.skill': 'Skill',
         'written.tab.session': 'This session',
         'written.tab.plugin': 'This plugin',
         'written.sessionEmpty': 'Nothing from this conversation yet — reviews appear here once the threshold fires',
@@ -152,6 +157,9 @@ window.__ModuleLoader__.load({
         'signal.stats': 'Recent signals: {t} (abort {a} · failures {f} · correction {c}) · triggered {r} reviews · yielded {y}',
         'signal.none': 'no recent acceleration signals',
         'signal.accelerated': 'accelerated ({k}) — review fires at the next turn end',
+        'signal.kind.abort': 'abort',
+        'signal.kind.tool-failure': 'tool failures',
+        'signal.kind.correction': 'correction',
       },
     }
 
@@ -245,13 +253,18 @@ window.__ModuleLoader__.load({
         }, [sessionId, nonce])
 
         var saveMode = function (mode) { savePatch({ mode: mode }) }
+        var _fe = React.useState(false)
+        var flashErr = _fe[0]
+        var setFlashErr = _fe[1]
         var savePatch = function (patch) {
           fetch('/hermes-loop/api/settings', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ patch: patch }),
-          }).then(function () { setNonce(function (n) { return n + 1 }); setFlash(true); setTimeout(function () { setFlash(false) }, 1500) })
-            .catch(function () {})
+          }).then(function (r) {
+            if (!r.ok) throw new Error('HTTP ' + r.status)
+            setNonce(function (n) { return n + 1 }); setFlash(true); setTimeout(function () { setFlash(false) }, 1500)
+          }).catch(function () { setFlashErr(true); setTimeout(function () { setFlashErr(false) }, 2500) })
         }
 
         var manualState = React.useState(null) // null | 'queued' | 'started' | 'already-running'
@@ -263,8 +276,13 @@ window.__ModuleLoader__.load({
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ sessionId: sessionId || '' }),
           }).then(function (r) { return r.json() })
-            .then(function (d) { setManualFlash(d.state || 'started'); setTimeout(function () { setManualFlash(null) }, 2500); setNonce(function (n) { return n + 1 }) })
-            .catch(function () {})
+            .then(function (d) {
+              // 失败响应（非活会话 404 等）body 是 { error }——不能再假装已入队
+              setManualFlash(d && d.error ? 'error:' + d.error : (d.state || 'started'))
+              setTimeout(function () { setManualFlash(null) }, 3500)
+              setNonce(function (n) { return n + 1 })
+            })
+            .catch(function () { setManualFlash('error:network'); setTimeout(function () { setManualFlash(null) }, 3500) })
         }
 
         var _cur = React.useState(null)
@@ -321,14 +339,18 @@ window.__ModuleLoader__.load({
               onClick: reviewNow,
             }, t('manual')),
             h('button', { className: 'hl-chip', onClick: function () { setNonce(function (n) { return n + 1 }) } }, t('refresh')),
-            flash ? h('span', { className: 'hl-mut' }, t('saved')) : null),
+            flash ? h('span', { className: 'hl-mut' }, t('saved')) : null,
+            flashErr ? h('span', { className: 'hl-err' }, t('saveFailed')) : null),
           runningReview && data.running.preview
             ? h('div', { className: 'hl-card' },
               h('h3', null, t('preview')),
               h('div', { style: { whiteSpace: 'pre-wrap', fontFamily: 'ui-monospace,monospace', fontSize: '11px', opacity: .75, maxHeight: '160px', overflow: 'auto' } },
                 String(data.running.preview).slice(-800)))
             : null,
-          manualFlash === 'queued' || manualFlash === 'already-running' ? h('div', { className: 'hl-mut' }, t('manualQueued')) : null,
+          manualFlash && manualFlash !== 'started'
+            ? h('div', { className: manualFlash.indexOf('error:') === 0 ? 'hl-err' : 'hl-mut' },
+              manualFlash.indexOf('error:') === 0 ? manualFlash.slice(6) : t('manualQueued'))
+            : null,
 
           // 设置卡：模式 + 阈值
           h('div', { className: 'hl-card' },
@@ -401,7 +423,7 @@ window.__ModuleLoader__.load({
             h('div', { className: 'hl-row hl-mut' },
               t('cooldown') + ': ' + (cooldownLeft > 0 ? t('cooldownWait', { s: cooldownLeft }) : t('cooldownReady'))),
             cur.signal ? h('div', { className: 'hl-row' },
-              h('span', { className: 'hl-tag' }, t('signal.accelerated', { k: cur.signal }))) : null),
+              h('span', { className: 'hl-tag' }, t('signal.accelerated', { k: t('signal.kind.' + cur.signal) }))) : null),
 
           // 沉淀产物：本对话（默认）/ 本插件 两个子 tab
           (function () {
@@ -437,20 +459,21 @@ window.__ModuleLoader__.load({
           // 技能使用统计（模型经 skill 工具的真实调用 + 目录曝光）
           (function () {
             var u = data.usage || { rows: [], totalCalls: 0, catalogEntries: 0, neverCalled: 0 }
+            var rows = Array.isArray(u.rows) ? u.rows : [] // 防御：契约漂移也不能让整个 tab 静默崩
             return h('div', { className: 'hl-card' },
               h('h3', null, t('usage')),
-              u.rows.length > 0
+              rows.length > 0
                 ? h('div', null,
-                  h('div', { className: 'hl-row hl-mut' }, t('usage.summary', { n: u.totalCalls, c: u.catalogEntries, z: u.neverCalled })),
+                  h('div', { className: 'hl-row hl-mut' }, t('usage.summary', { n: u.totalCalls || 0, c: u.catalogEntries || 0, z: u.neverCalled || 0 })),
                   h('div', { className: 'hl-scroll' },
                     h('table', { className: 'hl-table' },
                       h('thead', null, h('tr', null,
-                        h('th', null, t('tab')),
+                        h('th', null, t('usage.skill')),
                         h('th', null, t('usage.calls')),
                         h('th', null, t('usage.last')),
                         h('th', null, t('usage.status'), ' ',
                           h('span', { className: 'hl-help', 'data-tip': t('usage.statusHelp') }, '?')))),
-                      h('tbody', null, u.rows.map(function (row, i) {
+                      h('tbody', null, rows.map(function (row, i) {
                         var zombie = row.count === 0
                         var statusText = row.modelInvocable === undefined ? '—' : (row.modelInvocable ? t('usage.modelVisible') : t('usage.modelDisabled'))
                         return h('tr', { key: i, style: zombie ? { opacity: .6 } : null },

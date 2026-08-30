@@ -867,3 +867,148 @@ test('parseCorrectionWords splits comma/enumeration separators and lowercases', 
   assert.equal(matchCorrectionWord('你这个结果 Wrong 吧', parseCorrectionWords('wrong')), 'wrong')
   assert.equal(matchCorrectionWord('完全正常', parseCorrectionWords('不对,错了')), undefined)
 })
+
+// ── 审查修复回归（2026-08-30 code review round）─────────────────────────
+
+test('review fix: patch succeeds for skills with description longer than the catalog cap', async () => {
+  // 回归 P1-1：baseDescription 曾用目录截断值做 CAS 基准，长描述技能永远 cas-conflict
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-longdesc-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const longDesc = 'd'.repeat(600) // 超过 catalogDescriptionMax 默认 500
+    const skillDir = join(home, 'skills', 'long-desc-skill')
+    await mkdir(skillDir, { recursive: true })
+    const original = `---\nname: "long-desc-skill"\ndescription: "${longDesc}"\n---\n\noriginal body\n`
+    await writeFile(join(skillDir, 'SKILL.md'), original)
+    const conclusion = JSON.stringify({
+      action: 'patch', skill: 'long-desc-skill', body: 'patched body',
+      baseHash: sha256(original), baseDescription: longDesc,
+    })
+    const services = fakeServices('```json\n' + conclusion + '\n```')
+    // snapshot 返回目录截断后的 description（复现真实环境），resourceBase 在全局库内
+    services.skills = {
+      snapshot: async () => ({ skills: [{ name: 'long-desc-skill', description: longDesc.slice(0, 500), resourceBase: { kind: 'directory', path: skillDir }, invocation: { modelInvocable: true } }], complete: true }),
+    }
+    const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, services)
+    const session = { id: 'session-longdesc', header: {}, deriveMessages: () => [{ role: 'user', content: 'we used long-desc-skill today' }] }
+    t.fire(session, completedTurn)
+    await new Promise((r) => setTimeout(r, 120))
+    assert.match(await readFile(join(skillDir, 'SKILL.md'), 'utf8'), /patched body/, 'long-description skill must be patchable')
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('review fix: project-level suspects are not injected (writer only knows the global library)', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-proj-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const services = fakeServices('```json\n{"action":"nothing"}\n```')
+    services.skills = {
+      snapshot: async () => ({ skills: [{ name: 'proj-skill', description: 'project scoped', resourceBase: { kind: 'directory', path: join(home, 'project', '.dsh', 'skills', 'proj-skill') }, invocation: { modelInvocable: true } }], complete: true }),
+    }
+    const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'log-only' }, services)
+    const session = { id: 'session-proj', header: {}, deriveMessages: () => [{ role: 'user', content: 'used proj-skill here' }] }
+    t.fire(session, completedTurn)
+    await new Promise((r) => setTimeout(r, 80))
+    const followup = services.created.find((c) => c && c.content)
+    const prompt = followup.content[0].text
+    assert.ok(!prompt.includes('### suspect:'), 'project-level skill must not be injected as a suspect (patch would be guaranteed patch-missing)')
+    assert.ok(prompt.includes('proj-skill'), 'catalog listing still includes it')
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('review fix: usage.json load merges with in-memory increments instead of clobbering', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-merge-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    await mkdir(join(home, 'hermes-loop'), { recursive: true })
+    await writeFile(join(home, 'hermes-loop', 'usage.json'), JSON.stringify({
+      savedAt: 'x',
+      usage: { 'merge-skill': { count: 7, lastUsedAt: '2026-08-01T00:00:00.000Z' } },
+      catalog: {},
+    }))
+    const services = fakeServices('```json\n{"action":"nothing"}\n```')
+    const t = setupPlugin({ turnInterval: 999, mode: 'log-only' }, services)
+    const session = { id: 'session-merge', header: {}, deriveMessages: () => [] }
+    // 加载 resolve 之前就可能到达的事件（竞态窗口）
+    t.fire(session, { type: 'tool/call', data: { name: 'skill', arguments: JSON.stringify({ name: 'merge-skill' }) } })
+    await new Promise((r) => setTimeout(r, 60))
+    const res = fakeRes()
+    await t.routes[0].handler({ method: 'GET', url: '/hermes-loop/api/status?sessionId=' }, res)
+    assert.equal(JSON.parse(res.body).usage.rows.find((r) => r.skill === 'merge-skill').count, 8,
+      'in-memory increment during the load window must survive the disk load')
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('review fix: two same-tick thresholds never run concurrently (serial invariant)', async () => {
+  const services = fakeServices('```json\n{"action":"nothing"}\n```')
+  let inFlight = 0
+  let maxInFlight = 0
+  let gate
+  const hold = new Promise((r) => { gate = r })
+  let created = 0
+  services.agents.create = async () => {
+    created += 1
+    inFlight += 1
+    maxInFlight = Math.max(maxInFlight, inFlight)
+    return {
+      agent: {
+        session: { seq: 0, events: [{ seq: 1, type: 'assistant/message', data: { message: { role: 'assistant', content: [{ type: 'text', text: '{"action":"nothing"}' }] } } }] },
+        followup() {},
+        whenIdle: () => (created === 1 ? hold : Promise.resolve()), // 第一个复盘吊住
+        cancel() {},
+      },
+      dispose: async () => { inFlight -= 1 },
+    }
+  }
+  const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'log-only' }, services)
+  const s1 = { id: 'session-serial-1', header: {}, deriveMessages: () => [] }
+  const s2 = { id: 'session-serial-2', header: {}, deriveMessages: () => [] }
+  // 同一同步调用栈连发两个阈值命中——微任务间隙曾是串行不变量的破口
+  t.fire(s1, completedTurn)
+  t.fire(s2, completedTurn)
+  await new Promise((r) => setTimeout(r, 30))
+  assert.equal(created, 1, 'second review must queue, not start')
+  assert.equal(maxInFlight, 1)
+  gate() // 放行第一个 → drainNext 接力第二个
+  await new Promise((r) => setTimeout(r, 80))
+  assert.equal(created, 2, 'queued review runs after the first finishes')
+  assert.equal(maxInFlight, 1, 'never concurrent')
+})
+
+test('review fix: settings fallback path validates instead of raw Object.assign', async () => {
+  const { sanitizeSettingsPatch } = plugin.__internals
+  assert.deepEqual(sanitizeSettingsPatch({ mode: 'typo', turnInterval: 0, cooldownMinutes: -5 }), {})
+  assert.deepEqual(sanitizeSettingsPatch({ mode: 'approval', turnInterval: 3 }), { mode: 'approval', turnInterval: 3 })
+  // 路由级：无 settings scope 时非法 patch 不生效
+  const services = fakeServices('```json\n{"action":"nothing"}\n```')
+  const t = setupPlugin({}, services) // settings: undefined → 回退路径
+  await new Promise((r) => setTimeout(r, 30))
+  const res = fakeRes()
+  await t.routes[0].handler(postJson('/hermes-loop/api/settings', { patch: { mode: 'typo', cooldownMinutes: -1 } }), res)
+  const body = JSON.parse(res.body)
+  assert.equal(res.statusCode, 200)
+  assert.equal(body.settings.mode, 'auto', 'invalid mode must not fall into the auto write branch silently')
+  assert.equal(body.settings.cooldownMinutes, 30, 'out-of-range numbers rejected')
+})
+
+test('review fix: overlong description is truncated, not dropped (fail-closed stays for body)', () => {
+  const c = parseConclusion(JSON.stringify({ action: 'create', skill: 'long-desc', description: 'x'.repeat(600), body: 'b' }))
+  assert.ok(c, 'conclusion survives an overlong description')
+  assert.equal(c.description.length, 500)
+  assert.equal(parseConclusion(JSON.stringify({ action: 'create', skill: 'x', description: 'd', body: 'y'.repeat(129 * 1024) })), undefined, 'oversized body still fail-closed')
+})
