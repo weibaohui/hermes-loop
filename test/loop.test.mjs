@@ -708,6 +708,38 @@ test('curator: manual pass archives an aged managed skill (flag flip), restore r
   }
 })
 
+test('curator: pre-existing plugin-created skills are backfilled from the audit ledger', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-backfill-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    // 存量：审计账本里有两条 created 记录；legacy-1 的文件还在，ghost-2 的文件被用户删了
+    await mkdir(join(home, 'skills', 'legacy-1'), { recursive: true })
+    await writeFile(join(home, 'skills', 'legacy-1', 'SKILL.md'), '---\nname: "legacy-1"\ndescription: "old"\n---\n\nbody\n')
+    await mkdir(join(home, 'hermes-loop'), { recursive: true })
+    await writeFile(join(home, 'hermes-loop', 'activity.jsonl'), [
+      JSON.stringify({ at: '2026-08-28T15:00:00.000Z', event: 'write-outcome', skill: 'legacy-1', result: 'created', path: '/x' }),
+      JSON.stringify({ at: '2026-08-28T16:00:00.000Z', event: 'write-outcome', skill: 'ghost-2', result: 'created', path: '/y' }),
+      JSON.stringify({ at: '2026-08-29T00:00:00.000Z', event: 'write-outcome', skill: 'legacy-1', result: 'patched', path: '/x' }),
+    ].join('\n') + '\n')
+    const services = fakeServices('```json\n{"action":"nothing"}\n```')
+    const t = setupPlugin({}, services)
+    await new Promise((r) => setTimeout(r, 80)) // usageLoaded + backfill
+    const res = fakeRes()
+    await t.routes[0].handler({ method: 'GET', url: '/hermes-loop/api/status?sessionId=' }, res)
+    const skills = JSON.parse(res.body).curator.skills
+    const legacy = skills.find((r) => r.skill === 'legacy-1')
+    assert.ok(legacy, 'audit-ledger created skill must be backfilled into the managed set')
+    assert.equal(legacy.createdAt, '2026-08-28T15:00:00.000Z')
+    assert.equal(legacy.state, 'active')
+    assert.ok(!skills.some((r) => r.skill === 'ghost-2'), 'deleted skill must not be managed (no ghosts)')
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
 test('curator: disabled setting skips the pass; created conclusions get registered as managed', async () => {
   const home = await mkdtemp(join(tmpdir(), 'hermes-loop-curator2-'))
   const oldHome = process.env.DSH_HOME

@@ -243,7 +243,7 @@ hermes-loop:
 
 ### 10.3 状态机（纯函数，单测覆盖）
 
-**纳管集**：dispatch 侧 `applyConclusion` 返回 `created` 时登记（`patch` 的目标是既有技能，归属不明不纳管）。记录持久化在 usage.json 的 `curator` 节：`skills: { <name>: { createdAt, state, lastRestoredAt? } }`；使用数据（count/lastUsedAt）仍在同文件 `usage` 节，不重复存。
+**纳管集**：事实依据统一为 **activity.jsonl 的 `write-outcome: created` 审计记录**——"这个 skill 是我们建的"只认账本（沉淀卡的 written 列表也来自同一来源）。登记发生在两处：dispatch 侧 `applyConclusion` 返回 `created` 时（新技能，`patch` 的目标归属不明不纳管）；插件加载时全量回填（`curator-backfill`）——v0.3 上线前的存量技能只存在于账本里，启动时扫账本的 created 记录补登记（文件已被用户手删的跳过，不纳管幽灵）。记录持久化在 usage.json 的 `curator` 节：`skills: { <name>: { createdAt, state, lastRestoredAt? } }`；使用数据（count/lastUsedAt）仍在同文件 `usage` 节，不重复存。
 
 对每个纳管技能（staleCutoff = now − staleDays，archiveCutoff = now − archiveDays）：
 

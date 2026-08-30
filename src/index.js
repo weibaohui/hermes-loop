@@ -637,7 +637,35 @@ module.exports = {
 
     // 惰性触发主路径（§10.2）：状态加载完成后补一轮停机期间到期的转移；
     // 12h 定时器只是进程存活期间的加速器——正确性不依赖它（差值是墙钟算的）。
-    usageLoaded.then(() => { runCuratorPass(false).catch(() => {}) })
+    // 之前先做存量回填：v0.3 上线前创建的技能不在纳管集里（沉淀卡与巡检卡对不上），
+    // activity.jsonl 的 write-outcome:created 记录是"我们建的"的权威证据——补登记。
+    const backfillManaged = async () => {
+      await usageLoaded
+      try {
+        const raw = await fsP.readFile(activityFile(), 'utf8')
+        let added = 0
+        for (const line of raw.trimEnd().split('\n')) {
+          let e
+          try { e = JSON.parse(line) } catch { continue }
+          if (e.event !== 'write-outcome' || e.result !== 'created' || typeof e.skill !== 'string') continue
+          if (curatorSkills.has(e.skill)) continue
+          // 文件已不在（用户手删）的跳过——别纳管幽灵
+          try { await fsP.stat(join(globalSkillsDir(), e.skill, 'SKILL.md')) } catch { continue }
+          curatorSkills.set(e.skill, {
+            createdAt: typeof e.at === 'string' ? e.at : new Date().toISOString(),
+            state: 'active',
+          })
+          added += 1
+        }
+        if (added > 0) {
+          try { await flushUsage() } catch {}
+          trace('curator-backfill', { added })
+          ctx.logger.info && ctx.logger.info(`hermes-loop: curator backfilled ${added} pre-existing skill(s) from the audit ledger`)
+        }
+      } catch { /* 无 activity 文件：新装，无可回填 */ }
+    }
+    backfillManaged()
+      .then(() => runCuratorPass(false).catch(() => {}))
     ctx.effect(() => {
       const timer = setInterval(() => { runCuratorPass(false).catch(() => {}) }, 12 * 60 * 60 * 1000)
       if (typeof timer.unref === 'function') timer.unref()
