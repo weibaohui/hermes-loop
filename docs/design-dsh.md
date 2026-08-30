@@ -206,5 +206,11 @@ hermes-loop:
 ## 9. 分阶段实现计划（v2 修订）
 
 - **v0.1（最小闭环）**：`session/event` 订阅 + 阈值/冷却/排除逻辑（含 perSession abort 链路，§3.6 伪代码）+ review runner（agents.create + restrict + whenIdle + 事件泵，复用 skills-management 的 runShareInProcess 模式）+ JSON 结论解析 + auto 写入 `~/.dsh/skills` + CAS 守卫（§6 两步）+ settings + ctx.effect 生命周期清理。验收：跑 10+ turn 的真实会话，确认 review 触发、skill 落盘、**下一个新会话的 available_skills 目录里出现该 skill**；
-- **v0.2（信任与体验）——已完结**：approval 模式 + pending 目录 ✅（~~待审 UI~~ 经评审取消，Hermes 亦无 GUI）；~~疑似相关 skill 全文注入~~ 提前至 v0.1 ✅；order 51 in-session patch 纪律 section ✅（7e151d3）；review 结论回显到来源会话 ✅（`session.append('user/message')` + plugin notice，1386a4d 前后）；~~项目级 skill 目录写入~~ 经评审取消（不稳定，统一写全局）。
+- **v0.2（信任与体验）——已完结**：approval 模式 + pending 目录 ✅（~~待审 UI~~ 经评审取消，Hermes 亦无 GUI）；~~疑似相关 skill 全文注入~~ 提前至 v0.1 ✅；order 51 in-session patch 纪律 section ✅（7e151d3）；review 结论回显到来源会话 ✅（`session.append('user/message')` + plugin notice）；~~项目级 skill 目录写入~~ 经评审取消（不稳定，统一写全局）。
+- **v2 线追加交付（2026-08-29，均在 v0.3 设计之外提前落地）**：
+  - **客户端面板**：conversation.view 第 5 个 tab（c31b510 起）——模式切换、阈值进度条、冷却倒计时、沉淀技能（本对话/本插件子 tab）、复盘总结（status.reviews 聚合，后应用户要求移除 UI 保留 API）；
+  - **手动"立即复盘"**：POST /api/review-now + 面板按钮 + review 运行中实时输出预览（d619090/368aac3）；
+  - **技能使用统计**：tool/call 按技能计数 + skill-catalog 曝光计数，usage.json 持久化，面板统计卡（d821532）——僵尸识别（曝光多零调用）为 Curator 供数；
+  - **可见性治理**：采用原生 frontmatter 键 `disable-model-invocation`（公开契约，docs/subsystems/skills.md）；patch 写入保留未知键（mergeFrontmatter）；skills-management 详情页开关 + 卡片"已隐藏"标记/隐藏按钮；usage 表状态列 + 悬停图例（98beaeb→d5e4040）；
+  - **附带修复**：市场库存 6600+ 条不再灌入模型目录（skills-management 49c3a41）；settings 迁移 schemastery + 命名空间合规（token 持久化修复，58e7231/c27bddb）。
 - **v0.3（防碎片化）**：~~疑似相关 skill 全文注入~~（提前至 v0.1 完成）；Curator 定时 pass（stale 标记、归档不删除）；信号加速触发（失败率/纠正词表）。候选新增：**memory 通道**（dsh 无原生 memory 机制；Hermes 原版 review 本就 memory+skill 合体，触发/守卫全复用；待出设计补充——载体 `~/.dsh/memory/MEMORY.md`、双结论协议、systemPrompt 注入）。

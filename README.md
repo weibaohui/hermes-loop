@@ -2,9 +2,11 @@
 
 把 [Hermes Agent](https://github.com/NousResearch/hermes-agent) 的 Learning Loop 移植到 dsh：对话收尾后自动复盘，把有价值的经验蒸馏成可复用的 skill。
 
-> ✅ **v0.1 已实现**（最小闭环：触发 → review → 写入 → 可见）。设计文档：[docs/design-dsh.md](docs/design-dsh.md)（v2.1）· [docs/research-hermes.md](docs/research-hermes.md)（Hermes 机制源码级调研）。
+> ✅ **v0.1 + v0.2 已实现并真实验收**（触发 → 复盘 → 写入 → 可见 → 面板 → 使用统计）。设计文档：[docs/design-dsh.md](docs/design-dsh.md)（v2.1）· [docs/research-hermes.md](docs/research-hermes.md)（Hermes 机制源码级调研）。
+>
+> 功能一览：自动复盘（阈值/冷却/前台优先）+ **手动"立即复盘"按钮**（带运行中实时输出预览）；skill create/patch（CAS 守卫）；auto/approval/log-only 三模式（面板即时切换）；结论回显到来源会话；in-session patch 纪律 section；**技能使用统计**（调用/目录曝光/僵尸识别，面板可视化）；与 skills-management 共享原生的 `disable-model-invocation` 治理键（patch 自动保留）。
 
-## 运行机制（v0.1）
+## 运行机制
 
 ```
 session/event（进程内全部会话）
