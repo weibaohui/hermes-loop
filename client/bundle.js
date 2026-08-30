@@ -74,6 +74,15 @@ window.__ModuleLoader__.load({
         'curator.lastUsed': '最后使用',
         'curator.stateHelp': '状态说明——活跃：技能正常注入对话目录；待退休：超过 stale 天数未被调用（仅标记，仍可被模型使用）；已归档：超过归档天数未用，已从模型目录隐藏（文件保留，可随时恢复）。巡检每天自动跑一次，也可点上方按钮立即执行。',
         'curator.skill': '技能',
+        'signal.title': '信号加速',
+        'signal.on': '开',
+        'signal.off': '关',
+        'signal.failures': '工具失败 ≥',
+        'signal.words': '纠正词',
+        'signal.help': '三类信号命中即标记窗口，下一个 turn 尾无视阈值提前复盘（冷却仍生效）：用户中断对话、窗口内工具连续失败、用户消息含纠正词。误触发的代价只是一次轻量复盘——精确性由复盘 agent 判断。词表逗号分隔，可自由改写（改动失焦即保存）。',
+        'signal.stats': '近期信号 {t} 次（中断 {a} · 失败 {f} · 纠正 {c}），触发复盘 {r} 次，产出 {y} 个',
+        'signal.none': '近期无加速信号',
+        'signal.accelerated': '已加速（{k}），下一个 turn 尾立即复盘',
       },
       en: {
         tab: 'Hermes Loop',
@@ -134,6 +143,15 @@ window.__ModuleLoader__.load({
         'curator.lastUsed': 'last used',
         'curator.stateHelp': 'Status legend — active: injected into conversation catalogs; stale: unused beyond the stale threshold (marker only, still model-usable); archived: unused beyond the archive threshold, hidden from the model catalog (file kept, restorable anytime). Inspection runs daily, or on demand via the button above.',
         'curator.skill': 'Skill',
+        'signal.title': 'Signal trigger',
+        'signal.on': 'on',
+        'signal.off': 'off',
+        'signal.failures': 'tool failures ≥',
+        'signal.words': 'correction words',
+        'signal.help': 'A hit on any signal marks the window; the next completed turn-end fires a review regardless of thresholds (cooldown still applies). Signals: user aborting a turn, a burst of tool failures, or a correction word in a user message. A false trigger costs one cheap review — precision is the review agent’s job. Comma-separated word list, editable (saved on blur).',
+        'signal.stats': 'Recent signals: {t} (abort {a} · failures {f} · correction {c}) · triggered {r} reviews · yielded {y}',
+        'signal.none': 'no recent acceleration signals',
+        'signal.accelerated': 'accelerated ({k}) — review fires at the next turn end',
       },
     }
 
@@ -169,6 +187,7 @@ window.__ModuleLoader__.load({
       '.hl-help{position:relative;display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.35));border-radius:50%;font-size:10px;color:var(--dsw-alias-label-secondary,inherit);cursor:help;vertical-align:middle}',
       '.hl-help::after{content:attr(data-tip);position:absolute;top:calc(100% + 8px);right:-6px;z-index:60;width:min(360px,72vw);white-space:normal;background:var(--dsw-alias-bg-layer-1,#fff);color:var(--dsw-alias-label-1,inherit);border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.3));border-radius:8px;padding:10px 12px;font-size:12px;font-weight:400;line-height:1.7;text-align:left;box-shadow:0 6px 20px rgba(0,0,0,.25);opacity:0;pointer-events:none;transition:opacity .12s}',
       '.hl-help:hover::after{opacity:1}',
+      '.hl-input{background:var(--dsw-alias-bg-layer-1,transparent);border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.3));border-radius:6px;padding:2px 8px;font-size:12px;color:inherit}',
     ].join('')
 
     var fmtTime = function (iso) {
@@ -225,11 +244,12 @@ window.__ModuleLoader__.load({
           return function () { alive = false; clearInterval(timer) }
         }, [sessionId, nonce])
 
-        var saveMode = function (mode) {
+        var saveMode = function (mode) { savePatch({ mode: mode }) }
+        var savePatch = function (patch) {
           fetch('/hermes-loop/api/settings', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ patch: { mode: mode } }),
+            body: JSON.stringify({ patch: patch }),
           }).then(function () { setNonce(function (n) { return n + 1 }); setFlash(true); setTimeout(function () { setFlash(false) }, 1500) })
             .catch(function () {})
         }
@@ -328,7 +348,50 @@ window.__ModuleLoader__.load({
               ' · ',
               t('toolCalls') + ' ≥ ' + eff.toolCallInterval,
               ' · ',
-              t('cooldown') + ' ' + eff.cooldownMinutes + 'min')),
+              t('cooldown') + ' ' + eff.cooldownMinutes + 'min'),
+
+            // 信号加速：开关 + 失败阈值 + 纠正词表 + 近期信号统计
+            h('div', { className: 'hl-row' },
+              h('span', { className: 'hl-mut' }, t('signal.title')),
+              h('button', {
+                className: 'hl-chip' + (eff.signalTriggerEnabled !== false ? ' on' : ''),
+                onClick: function () { savePatch({ signalTriggerEnabled: eff.signalTriggerEnabled === false }) },
+              }, eff.signalTriggerEnabled !== false ? t('signal.on') : t('signal.off')),
+              h('span', { className: 'hl-help', 'data-tip': t('signal.help') }, '?'),
+              h('span', { style: { flex: 1 } }),
+              (function () {
+                var sg = data.signals || { total: 0 }
+                return h('span', null,
+                  sg.total > 0
+                    ? t('signal.stats', { t: sg.total, a: sg.abort || 0, f: sg.toolFailure || 0, c: sg.correction || 0, r: sg.triggeredReviews || 0, y: sg.yieldedReviews || 0 })
+                    : t('signal.none'))
+              })()),
+            eff.signalTriggerEnabled !== false ? h('div', { className: 'hl-row' },
+              h('span', { className: 'hl-mut' }, t('signal.failures')),
+              h('input', {
+                key: 'f' + eff.signalToolFailureMin,
+                className: 'hl-input',
+                type: 'number', min: 0, max: 20,
+                defaultValue: eff.signalToolFailureMin,
+                style: { width: '60px' },
+                onKeyDown: function (e) { if (e.key === 'Enter') e.target.blur() },
+                onBlur: function (e) {
+                  var v = parseInt(e.target.value, 10)
+                  if (!isNaN(v) && v >= 0 && v !== eff.signalToolFailureMin) savePatch({ signalToolFailureMin: v })
+                },
+              })) : null,
+            eff.signalTriggerEnabled !== false ? h('div', { className: 'hl-row' },
+              h('span', { className: 'hl-mut' }, t('signal.words')),
+              h('input', {
+                key: 'w' + eff.signalCorrectionWords,
+                className: 'hl-input',
+                defaultValue: eff.signalCorrectionWords,
+                style: { flex: 1, minWidth: '240px' },
+                onKeyDown: function (e) { if (e.key === 'Enter') e.target.blur() },
+                onBlur: function (e) {
+                  if (e.target.value !== eff.signalCorrectionWords) savePatch({ signalCorrectionWords: e.target.value })
+                },
+              })) : null),
 
           // 本会话进度
           h('div', { className: 'hl-card' },
@@ -336,7 +399,9 @@ window.__ModuleLoader__.load({
             turnsMax > 0 ? h(Bar, { label: t('turns'), value: cur.turns || 0, max: turnsMax, pct: pct(cur.turns || 0, turnsMax) }) : null,
             toolsMax > 0 ? h(Bar, { label: t('toolCalls'), value: cur.toolCalls || 0, max: toolsMax, pct: pct(cur.toolCalls || 0, toolsMax) }) : null,
             h('div', { className: 'hl-row hl-mut' },
-              t('cooldown') + ': ' + (cooldownLeft > 0 ? t('cooldownWait', { s: cooldownLeft }) : t('cooldownReady')))),
+              t('cooldown') + ': ' + (cooldownLeft > 0 ? t('cooldownWait', { s: cooldownLeft }) : t('cooldownReady'))),
+            cur.signal ? h('div', { className: 'hl-row' },
+              h('span', { className: 'hl-tag' }, t('signal.accelerated', { k: cur.signal }))) : null),
 
           // 沉淀产物：本对话（默认）/ 本插件 两个子 tab
           (function () {

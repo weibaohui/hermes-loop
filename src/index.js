@@ -79,6 +79,11 @@ const DEFAULTS = {
   curatorStaleDays: 30,
   curatorArchiveDays: 90,
   curatorIntervalHours: 24,
+  // ── 信号加速触发（v0.4）：触发器求便宜+高召回，精确性交给复盘 agent 的负面清单 ──
+  signalTriggerEnabled: true,
+  signalToolFailureMin: 3,   // 窗口内 tool/result 失败 ≥N 次 → 加速（0=关）
+  // 内置中英默认词表；用户可在面板/settings.yaml 整体改写（逗号分隔，全量替换）
+  signalCorrectionWords: '不对,错了,重来,别这样,应该是,你弄错了,wrong,try again,not what i,stop doing',
 }
 
 function settingsSchema() {
@@ -100,6 +105,9 @@ function settingsSchema() {
     curatorStaleDays: Schema.number().min(1).default(30),
     curatorArchiveDays: Schema.number().min(2).default(90),
     curatorIntervalHours: Schema.number().min(1).default(24),
+    signalTriggerEnabled: Schema.boolean().default(true),
+    signalToolFailureMin: Schema.number().min(0).default(3),
+    signalCorrectionWords: Schema.string().default('不对,错了,重来,别这样,应该是,你弄错了,wrong,try again,not what i,stop doing'),
   })
 }
 
@@ -344,6 +352,20 @@ function setModelInvocation(content, modelInvocable) {
 
 const DAY_MS = 24 * 60 * 60 * 1000
 
+/** 纠正词表解析：逗号/顿号/分号/换行分隔，小写化，去空。 */
+function parseCorrectionWords(raw) {
+  return String(raw || '')
+    .split(/[,，、;；\n]/)
+    .map((w) => w.trim().toLowerCase())
+    .filter((w) => w.length > 0)
+}
+
+/** 在文本里找第一个命中的纠正词（小写比较；返回原词供审计）。 */
+function matchCorrectionWord(text, words) {
+  const hay = String(text || '').toLowerCase()
+  return words.find((w) => hay.includes(w))
+}
+
 /**
  * Curator 纯代码状态机（design §10.3，对齐 hermes curator.apply_automatic_transitions）。
  * 输入纳管记录与使用统计，返回需要变更的转移计划——不做任何 I/O，便于单测。
@@ -452,7 +474,7 @@ module.exports = {
     reasonKind, contentToText, renderTranscript, tokenize, rankSuspects,
     extractFencedJson, parseConclusion, sha256, buildSkillMd, mergeFrontmatter, applyConclusion,
     descriptionOf, atomicWrite, DEFAULTS, dshHome, globalSkillsDir, pendingDir,
-    setModelInvocation, curatorTransitions,
+    setModelInvocation, curatorTransitions, parseCorrectionWords, matchCorrectionWord,
   },
 
   apply(ctx, config = {}) {
@@ -674,8 +696,16 @@ module.exports = {
 
     const stateFor = (sessionId) => {
       let st = windows.get(sessionId)
-      if (st === undefined) windows.set(sessionId, st = { turns: 0, toolCalls: 0, lastReviewAt: 0 })
+      if (st === undefined) windows.set(sessionId, st = { turns: 0, toolCalls: 0, lastReviewAt: 0, failures: 0, signal: undefined })
       return st
+    }
+
+    // 信号加速（v0.4）：硬信号（abort/工具失败）与软信号（纠正词）只做"标记窗口"，
+    // 复盘的精确性由 review agent 的负面清单兜底——误触发的代价是一次便宜模型的 nothing。
+    const markSignal = (sessionId, st, kind, detail) => {
+      if (st.signal !== undefined) return // 一窗口一记，先到为准
+      st.signal = { kind, at: new Date().toISOString(), detail }
+      trace('signal', { sessionId, kind, detail })
     }
 
     const drainNext = () => {
@@ -689,13 +719,17 @@ module.exports = {
       const sessionId = session.id
       const controller = new AbortController()
       const st = stateFor(sessionId)
-      // 计数器在进入 runner 时重置（abort 也算消耗窗口，防重触发循环）
+      // 计数器在进入 runner 时重置（abort 也算消耗窗口，防重触发循环）；
+      // 信号同样消费掉——一次复盘消化掉本窗口的加速标记
+      const firedSignal = st.signal
       st.turns = 0
       st.toolCalls = 0
+      st.failures = 0
+      st.signal = undefined
       st.lastReviewAt = Date.now()
       running = { sessionId, controller }
       runningSince = new Date().toISOString()
-      trace('review-start', { sessionId, manual })
+      trace('review-start', { sessionId, manual, signal: firedSignal && firedSignal.kind, signalDetail: firedSignal && firedSignal.detail })
 
       let handle
       try {
@@ -905,6 +939,27 @@ module.exports = {
           }
           return
         }
+        // 工具失败突发（硬信号）：tool/result 失败在窗口内累计，超阈值即加速
+        if (event.type === 'tool/result') {
+          const failed = event.data && ((event.data.message && event.data.message.isError === true) || event.data.error !== undefined)
+          if (failed) {
+            const st = stateFor(sessionId)
+            st.failures += 1
+            if (eff.signalTriggerEnabled && eff.signalToolFailureMin > 0 && st.failures >= eff.signalToolFailureMin) {
+              markSignal(sessionId, st, 'tool-failure', `${st.failures} tool failures in window`)
+            }
+          }
+          return
+        }
+        // 纠正词（软信号）：只匹配真实用户输入（kind=user），我们自己的 plugin notice
+        // 和 skill-catalog 注入天然不会命中
+        if (event.type === 'user/message' && event.data && event.data.source && event.data.source.kind === 'user') {
+          if (eff.signalTriggerEnabled) {
+            const hit = matchCorrectionWord(contentToText(event.data.content), parseCorrectionWords(eff.signalCorrectionWords))
+            if (hit !== undefined) markSignal(sessionId, stateFor(sessionId), 'correction', hit)
+          }
+          return
+        }
         // 目录曝光统计：skill-catalog 注入消息带本次发布的全部条目
         if (event.type === 'user/message' && event.data && event.data.source && event.data.source.kind === 'skill-catalog' && Array.isArray(event.data.source.entries)) {
           for (const entry of event.data.source.entries) {
@@ -918,15 +973,24 @@ module.exports = {
           return
         }
         if (event.type !== 'turn/end') return
-        if (reasonKind(event.data && event.data.reason) !== 'completed') return
+        const endedAs = reasonKind(event.data && event.data.reason)
+        // 用户中断（硬信号）：aborted turn 此前只被排除计数——现在反向用作触发理由
+        if (endedAs === 'aborted') {
+          if (eff.signalTriggerEnabled) markSignal(sessionId, stateFor(sessionId), 'abort', 'user stopped the turn')
+          return
+        }
+        if (endedAs !== 'completed') return
 
         const st = stateFor(sessionId)
         st.turns += 1
         const cooledDown = Date.now() - st.lastReviewAt >= eff.cooldownMinutes * 60 * 1000
         const hitTurn = eff.turnInterval > 0 && st.turns >= eff.turnInterval
         const hitTools = eff.toolCallInterval > 0 && st.toolCalls >= eff.toolCallInterval
-        trace('threshold', { sessionId, turns: st.turns, toolCalls: st.toolCalls, cooledDown, hitTurn, hitTools })
-        if (!cooledDown || (!hitTurn && !hitTools)) return
+        const accelerated = st.signal !== undefined
+        trace('threshold', { sessionId, turns: st.turns, toolCalls: st.toolCalls, cooledDown, hitTurn, hitTools, accelerated })
+        // 信号命中 → 跳过 turn/工具阈值提前结算；冷却仍然生效（防刷屏），
+        // 冷却期内的标记保留到冷却结束后的下一个 turn 尾再消费
+        if (!cooledDown || (!hitTurn && !hitTools && !accelerated)) return
 
         const task = () => runReview({ session, eff })
         if (running === null) {
@@ -983,7 +1047,7 @@ module.exports = {
       const eff = effective()
       const sessions = {}
       for (const [sid, st] of windows) {
-        sessions[sid] = { turns: st.turns, toolCalls: st.toolCalls, lastReviewAt: st.lastReviewAt || undefined }
+        sessions[sid] = { turns: st.turns, toolCalls: st.toolCalls, lastReviewAt: st.lastReviewAt || undefined, failures: st.failures, signal: st.signal && st.signal.kind }
       }
       const activity = await readActivityTail()
       // 回填 sessionId：write-outcome 本身不带，从同 skill 最近的 dispatch 事件取
@@ -1007,7 +1071,7 @@ module.exports = {
       let currentReview = null
       for (const e of activity) {
         if (e.event === 'review-start') {
-          currentReview = { at: e.at, sessionId: e.sessionId, outcome: 'running', action: undefined, skill: undefined, rationale: undefined, suspects: undefined, catalogSize: undefined, messages: undefined, detail: undefined }
+          currentReview = { at: e.at, sessionId: e.sessionId, outcome: 'running', action: undefined, skill: undefined, rationale: undefined, suspects: undefined, catalogSize: undefined, messages: undefined, detail: undefined, signal: e.signal }
           reviews.push(currentReview)
           continue
         }
@@ -1060,6 +1124,17 @@ module.exports = {
         neverCalled: usageRows.filter((r) => r.count === 0).length,
         rows: usageRows.slice(0, 50),
       }
+      // 信号加速的"命中率"面板数据（§信号加速设计：智能不在词表，在度量）：
+      // 近期信号次数按类型分布 + 信号触发的复盘数 + 其中产出沉淀的复盘数
+      const signalEvents = activity.filter((e) => e.event === 'signal')
+      const signalStats = {
+        total: signalEvents.length,
+        abort: signalEvents.filter((e) => e.kind === 'abort').length,
+        toolFailure: signalEvents.filter((e) => e.kind === 'tool-failure').length,
+        correction: signalEvents.filter((e) => e.kind === 'correction').length,
+        triggeredReviews: reviews.filter((r) => r.signal).length,
+        yieldedReviews: reviews.filter((r) => r.signal && (r.outcome === 'created' || r.outcome === 'patched' || r.outcome === 'staged')).length,
+      }
       // Curator 面板数据（§10.5）：纳管技能行 = 状态机记录 × 使用统计 × 目录实时可见性
       const stateRank = { archived: 0, stale: 1, active: 2 }
       const curatorRows = [...curatorSkills.entries()]
@@ -1095,6 +1170,7 @@ module.exports = {
         written,
         usage: usageStats,
         curator,
+        signals: signalStats,
       }
     }
 

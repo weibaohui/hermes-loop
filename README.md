@@ -4,7 +4,7 @@
 
 > ✅ **v0.1 + v0.2 + v0.3（Curator）已实现并真实验收**（触发 → 复盘 → 写入 → 可见 → 面板 → 使用统计 → 技能库维护）。设计文档：[docs/design-dsh.md](docs/design-dsh.md)（v2.1 + §10）· [docs/research-hermes.md](docs/research-hermes.md)（Hermes 机制源码级调研）。
 >
-> 功能一览：自动复盘（阈值/冷却/前台优先）+ **手动"立即复盘"按钮**（带运行中实时输出预览）；skill create/patch（CAS 守卫）；auto/approval/log-only 三模式（面板即时切换）；结论回显到来源会话；in-session patch 纪律 section；**技能使用统计**（调用/目录曝光/僵尸识别，面板可视化）；与 skills-management 共享原生的 `disable-model-invocation` 治理键（patch 自动保留）；**Curator 技能库维护**（纳管集=本插件 created 的技能；active↔stale→archived 三态状态机，归档=翻治理键、永不删除、面板可恢复；墙钟差值+惰性求值，插件不常驻也判得准）。
+> 功能一览：自动复盘（阈值/冷却/前台优先）+ **信号加速触发**（用户中断/工具失败突发/纠正词命中即跳过阈值提前复盘，词表面板可改、命中率面板度量）+ **手动"立即复盘"按钮**（带运行中实时输出预览）；skill create/patch（CAS 守卫）；auto/approval/log-only 三模式（面板即时切换）；结论回显到来源会话；in-session patch 纪律 section；**技能使用统计**（调用/目录曝光/僵尸识别，面板可视化）；与 skills-management 共享原生的 `disable-model-invocation` 治理键（patch 自动保留）；**Curator 技能库维护**（纳管集=本插件 created 的技能；active↔stale→archived 三态状态机，归档=翻治理键、永不删除、面板可恢复；墙钟差值+惰性求值，插件不常驻也判得准）。
 
 ## 运行机制
 
@@ -64,6 +64,9 @@ chokidar watcher 自动失效 registry → 下一个新会话的 available_skill
 | `curatorStaleDays` | `30` | 纳管技能多少天未用标记"待退休"（仅标记，文件不动） |
 | `curatorArchiveDays` | `90` | 多少天未用归档（翻 `disable-model-invocation` 隐藏出模型目录，可面板恢复） |
 | `curatorIntervalHours` | `24` | 自动巡检最小间隔；面板"立即巡检"按钮不受限 |
+| `signalTriggerEnabled` | `true` | 信号加速总开关（§11）：abort/工具失败/纠正词命中 → 跳过阈值提前复盘 |
+| `signalToolFailureMin` | `3` | 窗口内 tool/result 失败 ≥N 次 → 加速（0=关） |
+| `signalCorrectionWords` | 内置中英词表 | 纠正词表，逗号分隔，面板可整体改写 |
 
 ## Curator（技能库维护）
 

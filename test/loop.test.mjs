@@ -777,3 +777,93 @@ test('curator: disabled setting skips the pass; created conclusions get register
     await rm(home2, { recursive: true, force: true })
   }
 })
+
+// ── signal-accelerated triggering (v0.4) ─────────────────────────────────
+
+function countingServices() {
+  const services = fakeServices('```json\n{"action":"nothing"}\n```')
+  const counter = { reviews: 0 }
+  services.agents.create = async () => { counter.reviews += 1; return { agent: fakeIdleAgent('{"action":"nothing"}'), dispose: async () => {} } }
+  return { services, counter }
+}
+
+test('signal: aborted turn accelerates the next completed turn below threshold', async () => {
+  const { services, counter } = countingServices()
+  const t = setupPlugin({ turnInterval: 999, toolCallInterval: 999, cooldownMinutes: 0, mode: 'log-only' }, services)
+  const session = { id: 'session-sig-abort', header: {}, deriveMessages: () => [] }
+  t.fire(session, { type: 'turn/end', data: { reason: { kind: 'aborted' } } })
+  await new Promise((r) => setTimeout(r, 40))
+  assert.equal(counter.reviews, 0, 'abort marks the window but never fires mid-turn')
+  t.fire(session, completedTurn)
+  await new Promise((r) => setTimeout(r, 60))
+  assert.equal(counter.reviews, 1, 'accelerated window fires at the next completed turn despite thresholds')
+  // 信号已被消费：再来一个 completed turn（仍低于阈值）不再触发
+  t.fire(session, completedTurn)
+  await new Promise((r) => setTimeout(r, 60))
+  assert.equal(counter.reviews, 1, 'signal is consumed by the review it fired')
+})
+
+test('signal: tool failure burst accelerates at the configured minimum', async () => {
+  const { services, counter } = countingServices()
+  const t = setupPlugin({ turnInterval: 999, toolCallInterval: 999, cooldownMinutes: 0, mode: 'log-only', signalToolFailureMin: 3 }, services)
+  const session = { id: 'session-sig-fail', header: {}, deriveMessages: () => [] }
+  const okResult = { type: 'tool/result', data: { message: { isError: false, content: [] } } }
+  const failResult = { type: 'tool/result', data: { message: { isError: true, content: [] } } }
+  t.fire(session, failResult)
+  t.fire(session, okResult) // 成功结果不计数
+  t.fire(session, failResult)
+  t.fire(session, completedTurn) // 只有 2 次失败，未到阈值 → 不触发
+  await new Promise((r) => setTimeout(r, 50))
+  assert.equal(counter.reviews, 0, 'below the failure minimum: no acceleration')
+  t.fire(session, failResult) // 第 3 次失败 → 窗口标记
+  t.fire(session, completedTurn)
+  await new Promise((r) => setTimeout(r, 60))
+  assert.equal(counter.reviews, 1, 'third failure accelerates')
+})
+
+test('signal: correction words only count real user input, not plugin notices', async () => {
+  const { services, counter } = countingServices()
+  const t = setupPlugin({ turnInterval: 999, toolCallInterval: 999, cooldownMinutes: 0, mode: 'log-only' }, services)
+  const session = { id: 'session-sig-word', header: {}, deriveMessages: () => [] }
+  // 我们自己的回显（kind=plugin）和目录注入（kind=skill-catalog）绝不算用户纠正
+  t.fire(session, { type: 'user/message', data: { content: [{ type: 'text', text: '这个结果不对吧' }], source: { kind: 'plugin' } } })
+  t.fire(session, { type: 'user/message', data: { content: [{ type: 'text', text: '不对' }], source: { kind: 'skill-catalog', entries: [] } } })
+  t.fire(session, completedTurn)
+  await new Promise((r) => setTimeout(r, 50))
+  assert.equal(counter.reviews, 0, 'plugin/catalog messages must not accelerate')
+  t.fire(session, { type: 'user/message', data: { content: [{ type: 'text', text: '不对，重来' }], source: { kind: 'user' } } })
+  t.fire(session, completedTurn)
+  await new Promise((r) => setTimeout(r, 60))
+  assert.equal(counter.reviews, 1, 'correction word in a real user message accelerates')
+})
+
+test('signal: master switch disables all acceleration; cooldown still gates signals', async () => {
+  const { services, counter } = countingServices()
+  const off = setupPlugin({ turnInterval: 999, cooldownMinutes: 0, mode: 'log-only', signalTriggerEnabled: false }, services)
+  const session = { id: 'session-sig-off', header: {}, deriveMessages: () => [] }
+  off.fire(session, { type: 'turn/end', data: { reason: { kind: 'aborted' } } })
+  off.fire(session, { type: 'user/message', data: { content: [{ type: 'text', text: '不对' }], source: { kind: 'user' } } })
+  off.fire(session, completedTurn)
+  await new Promise((r) => setTimeout(r, 50))
+  assert.equal(counter.reviews, 0, 'signalTriggerEnabled=false disables every signal kind')
+
+  // 冷却仍生效：先正常触发一次复盘（turnInterval=1），随后信号命中，
+  // 冷却期内的 completed turn 不能点火
+  const gated = countingServices()
+  const t2 = setupPlugin({ turnInterval: 1, cooldownMinutes: 60, mode: 'log-only' }, gated.services)
+  const s2 = { id: 'session-sig-cool', header: {}, deriveMessages: () => [] }
+  t2.fire(s2, completedTurn)
+  await new Promise((r) => setTimeout(r, 60))
+  assert.equal(gated.counter.reviews, 1)
+  t2.fire(s2, { type: 'turn/end', data: { reason: { kind: 'aborted' } } }) // 信号命中
+  t2.fire(s2, completedTurn) // 冷却中 → 不应触发
+  await new Promise((r) => setTimeout(r, 50))
+  assert.equal(gated.counter.reviews, 1, 'cooldown gates signal-accelerated reviews too')
+})
+
+test('parseCorrectionWords splits comma/enumeration separators and lowercases', () => {
+  const { parseCorrectionWords, matchCorrectionWord } = plugin.__internals
+  assert.deepEqual(parseCorrectionWords('不对, Wrong， 重来；;Try Again\n别这样'), ['不对', 'wrong', '重来', 'try again', '别这样'])
+  assert.equal(matchCorrectionWord('你这个结果 Wrong 吧', parseCorrectionWords('wrong')), 'wrong')
+  assert.equal(matchCorrectionWord('完全正常', parseCorrectionWords('不对,错了')), undefined)
+})

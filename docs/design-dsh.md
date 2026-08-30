@@ -218,7 +218,7 @@ hermes-loop:
   - **技能使用统计**：tool/call 按技能计数 + skill-catalog 曝光计数，usage.json 持久化，面板统计卡（d821532）——僵尸识别（曝光多零调用）为 Curator 供数；
   - **可见性治理**：采用原生 frontmatter 键 `disable-model-invocation`（公开契约，docs/subsystems/skills.md）；patch 写入保留未知键（mergeFrontmatter）；skills-management 详情页开关 + 卡片"已隐藏"标记/隐藏按钮；usage 表状态列 + 悬停图例（98beaeb→d5e4040）；
   - **附带修复**：市场库存 6600+ 条不再灌入模型目录（skills-management 49c3a41）；settings 迁移 schemastery + 命名空间合规（token 持久化修复，58e7231/c27bddb）。
-- **v0.3（防碎片化）**：~~疑似相关 skill 全文注入~~（提前至 v0.1 完成）；**Curator 纯代码退休 pass ✅（设计见 §10）**——墙钟差值 + 惰性求值的三态状态机（active↔stale→archived；归档=翻 `disable-model-invocation`，永不删除）；信号加速触发（失败率/纠正词表）。候选新增：**memory 通道**（dsh 无原生 memory 机制；Hermes 原版 review 本就 memory+skill 合体，触发/守卫全复用；待出设计补充——载体 `~/.dsh/memory/MEMORY.md`、双结论协议、systemPrompt 注入）。
+- **v0.3（防碎片化）**：~~疑似相关 skill 全文注入~~（提前至 v0.1 完成）；**Curator 纯代码退休 pass ✅（设计见 §10）**——墙钟差值 + 惰性求值的三态状态机（active↔stale→archived；归档=翻 `disable-model-invocation`，永不删除；纳管事实依据统一为 activity.jsonl 的 write-outcome:created 账本，加载时回填存量）；**信号加速触发 ✅（设计见 §11）**——abort/工具失败突发/纠正词三类信号命中即跳过阈值提前复盘，冷却仍生效，词表面板可改、命中率面板度量。候选新增：**memory 通道**（dsh 无原生 memory 机制；Hermes 原版 review 本就 memory+skill 合体，触发/守卫全复用；待出设计补充——载体 `~/.dsh/memory/MEMORY.md`、双结论协议、systemPrompt 注入）。
 
 ## 10. Curator 设计（v0.3 补充，2026-08-29）
 
@@ -290,3 +290,23 @@ curatorIntervalHours: 24  # 自动巡检的最小间隔；手动按钮不受限
 - **LLM 伞形合并**（MERGE INTO UMBRELLA / DEMOTE TO references）：原版默认关闭；等纯代码退休跑稳、纳管集出现真实碎片后再评估；
 - **tar.gz 全量快照**：原版做快照是因为它有 LLM pass 可以大面积重写文件；我们的归档动作完全可逆（翻键 + 面板恢复），无破坏性，不需要回滚介质；
 - **pinned/豁免清单**：纳管集本身就只有自写技能，范围已最小化。
+
+## 11. 信号加速触发（v0.4，2026-08-30）
+
+> 原计划 v0.3 第三项。设计共识（与用户对齐）：触发器求**便宜 + 高召回**，精确性交给复盘 agent 的负面清单兜底——误触发的代价只是一次便宜模型的 nothing；词表不做 AI 自维护（花判断层的钱优化代理层，且自改配置治理味重），真正的"智能"是面板上的命中率度量。
+
+### 三类信号（命中即标记窗口 `st.signal`，一窗口一记）
+
+| 信号 | 事件 | 说明 |
+|---|---|---|
+| 用户中断（硬） | `turn/end` reason.kind === 'aborted' | 此前只被排除计数，现在反向用作触发理由——按停止键=不满意 |
+| 工具失败突发（硬） | `tool/result` 的 `data.message.isError` | 窗口内失败 ≥ `signalToolFailureMin`（默认 3，0=关） |
+| 纠正词（软） | `user/message` 且 `source.kind === 'user'` | 内置中英默认词表，settings/面板可整体改写（逗号分隔，失焦保存）；plugin notice / skill-catalog 天然不命中 |
+
+### 结算语义
+
+信号只在 turn 尾结算：加速窗口的下一个 `turn/end(completed)` **跳过 turn/工具阈值**立即进队列；**冷却仍生效**（防刷屏），冷却期内命中的标记保留到冷却结束后的第一个 turn 尾消费。复盘进入 runner 时信号与失败计数一并消费。配置：`signalTriggerEnabled` / `signalToolFailureMin` / `signalCorrectionWords`（settings 命名空间 `hermes-loop`，面板阈值卡可改）。
+
+### 命中率度量（不做自动调节）
+
+review-start 审计事件带 `signal` 字段；status 快照的 `signals` 节聚合近期（activity 尾 60 行）：各类型信号数、信号触发的复盘数、其中产出沉淀的复盘数。词表太宽/太窄由人看数据判断，系统不自调——诚实且可解释。
