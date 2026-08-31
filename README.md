@@ -1,6 +1,6 @@
 # @weibaohui/hermes-loop
 
-[![DSH plugin](https://img.shields.io/badge/dsh-plugin-✅-green)](https://github.com/topics/dsh-plugin)
+[![DSH plugin](https://img.shields.io/badge/dsh-plugin-green)](https://github.com/topics/dsh-plugin)
 [![npm version](https://img.shields.io/npm/v/@weibaohui/hermes-loop)](https://www.npmjs.com/package/@weibaohui/hermes-loop)
 
 **自动复盘插件**：对话收尾后自动复盘，把有价值的经验蒸馏成可复用的技能（skill）。
