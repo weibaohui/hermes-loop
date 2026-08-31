@@ -1,6 +1,6 @@
 {
   "name": "@weibaohui/hermes-loop",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DeepSeek Harness plugin: Hermes-style learning loop — watches every session's turn/end events, distills valuable experience into reusable skills via a zero-tool background review agent.",
   "license": "MIT",
   "keywords": [
