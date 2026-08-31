@@ -28,13 +28,3 @@ dsh plugin --profile web add @weibaohui/hermes-loop -w
 2. 默认自动模式即可工作；想更稳妥可切换为「审批」模式（复盘写入前需你确认）
 3. 触发阈值、冷却时间、纠正词表均可在面板调整
 4. 复盘产出的技能进入技能库后，模型通过 `skill` 工具直接使用；使用统计与归档管理也在面板里
-
-## 发版（维护者）
-
-```bash
-npm version patch            # bump + commit + tag
-git push --follow-tags
-gh release create vX.Y.Z --generate-notes   # 创建 Release 触发自动发布到 npm
-```
-
-发布由 GitHub Actions 完成（Release published 触发；打 tag 不发布），走 npm Trusted Publishing 免 token。
