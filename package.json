@@ -22,6 +22,7 @@
   "files": [
     "src",
     "client",
+    "docs",
     "cordis.patch.yml"
   ],
   "scripts": {
