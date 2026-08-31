@@ -8,4 +8,4 @@
 
 - insert:
     - id: hermes-loop
-      name: 'dsh-plugin-hermes-loop'
+      name: '@weibaohui/hermes-loop'
