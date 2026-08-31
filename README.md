@@ -6,6 +6,25 @@
 >
 > 功能一览：自动复盘（阈值/冷却/前台优先）+ **信号加速触发**（用户中断/工具失败突发/纠正词命中即跳过阈值提前复盘，词表面板可改、命中率面板度量）+ **手动"立即复盘"按钮**（带运行中实时输出预览）；skill create/patch（CAS 守卫）；auto/approval/log-only 三模式（面板即时切换）；结论回显到来源会话；in-session patch 纪律 section；**技能使用统计**（调用/目录曝光/僵尸识别，面板可视化）；与 skills-management 共享原生的 `disable-model-invocation` 治理键（patch 自动保留）；**Curator 技能库维护**（纳管集=本插件 created 的技能；active↔stale→archived 三态状态机，归档=翻治理键、永不删除、面板可恢复；墙钟差值+惰性求值，插件不常驻也判得准）。
 
+
+## 安装
+
+```bash
+dsh plugin --profile web add @weibaohui/hermes-loop -w
+```
+
+装完重启 `dsh web` 即生效。
+
+## 发版（维护者）
+
+```bash
+npm version patch            # bump + commit + tag
+git push --follow-tags
+gh release create vX.Y.Z --generate-notes   # 创建 Release 触发自动发布到 npm
+```
+
+发布由 GitHub Actions 完成（Release published 触发；打 tag 不发布），走 npm Trusted Publishing 免 token。
+
 ## 运行机制
 
 ```

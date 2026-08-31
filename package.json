@@ -1,5 +1,5 @@
 {
-  "name": "dsh-plugin-hermes-loop",
+  "name": "@weibaohui/hermes-loop",
   "version": "0.1.0",
   "description": "DeepSeek Harness plugin: Hermes-style learning loop — watches every session's turn/end events, distills valuable experience into reusable skills via a zero-tool background review agent.",
   "license": "MIT",
@@ -10,7 +10,8 @@
     "plugin",
     "skills",
     "hermes",
-    "learning-loop"
+    "learning-loop",
+    "dsh-plugin"
   ],
   "main": "src/index.js",
   "exports": {
@@ -25,7 +26,8 @@
   ],
   "scripts": {
     "check": "node --check src/index.js && node --check client/bundle.js",
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "prepublishOnly": "npm run check && npm test"
   },
   "engines": {
     "node": ">=22.5"
@@ -40,5 +42,16 @@
     "client": {
       "platform": "web"
     }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/weibaohui/hermes-loop.git"
+  },
+  "homepage": "https://github.com/weibaohui/hermes-loop#readme",
+  "bugs": {
+    "url": "https://github.com/weibaohui/hermes-loop/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
