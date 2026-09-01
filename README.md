@@ -32,3 +32,7 @@ dsh plugin --profile web add @weibaohui/hermes-loop -w
 3. 触发阈值、冷却时间、纠正词表均可在面板调整
 4. 复盘产出的技能进入技能库后，模型通过 `skill` 工具直接使用；使用统计与归档管理也在面板里
 5. 记忆条目在面板查看用量与内容；增删改直接编辑 `~/.dsh/memory/MEMORY.md` / `USER.md`（一行一条、`§ ` 开头），下个会话生效
+
+## 联系我 :飞书群
+
+![link](https://foruda.gitee.com/images/1774880015525784725/4fd67005_77493.png "link")
