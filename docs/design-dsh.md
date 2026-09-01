@@ -21,7 +21,7 @@
 | 前台优先、review 可中断 | `agents.create({ signal: AbortSignal })`；新 turn/start 到来时 abort 旧 review | ✅ 对等 |
 | `skill_manage` 写入 + read-before-write 守卫 | 插件代码直接写 skill 目录 + 自研守卫（见 §6） | ✅ 对等 |
 | skill 写入即对后续会话可见 | skill-filesystem 的 chokidar watcher（~200ms 稳定阈值）自动 invalidate registry，下一个 pre-step 重新 snapshot，digest 变化即发布新目录消息 | ✅ 对等，**无需跨插件 invalidate**（实证：skill-filesystem/src/index.ts:528-588） |
-| MEMORY.md/USER.md | v1 不做（见 §7 范围） | ➖ 后续 |
+| MEMORY.md/USER.md | `~/.dsh/memory/{MEMORY,USER}.md` 双库 + `systemPrompt.context()` 快照注入（v0.5，设计见 §12） | ✅ v0.5 |
 | Curator 定时维护 | `ctx.effect` + setInterval（scheduled-items 模式） | ✅ v3 |
 | write_approval 审批 | pending 目录（已实现；**审批 UI 经评审决定不做**——Hermes 侧也只有 CLI 斜杠命令没有 GUI，dsh 侧 pending JSON 可直接手批） | ✅ 宿主侧 v0.1 / UI 取消 |
 
@@ -65,19 +65,20 @@ review runner（串行队列，防堆积）
       │  setup: agentCtx.tools.restrict({ allow: [] })   // 纯分析，零工具
       │  followup(reviewPrompt + catalog + transcriptTail)
       │  await whenIdle()，事件泵收集最终 assistant/message
-      ▼  解析结构化结论 { action: nothing|create|patch, ... }
-skill writer
-      │  CAS 守卫：patch 前重读目标文件比对 baseHash（§6 两步守卫①）
-      │  临时文件 + 原子 rename 写入（守卫②）
+      ▼  解析结构化结论 { action: nothing|create|patch, ..., memory? }   ← v0.5 双结论（§12.3）
+skill writer                                   memory writer（§12，同队列串行）
+      │  CAS 守卫：patch 前重读目标文件比对 baseHash（§6 两步守卫①）    │  去重/不可见字符与凭据扫描/限额/oldText 唯一定位（§12.4）
+      │  临时文件 + 原子 rename 写入（守卫②）                          │  整文件重排 + atomicWrite → ~/.dsh/memory/{MEMORY,USER}.md
       │  frontmatter 校验（kebab-case name、非空 description、≤500 字符）
       │  mode=auto → 写入目标目录；mode=approval → stage 到 pending/；
       │  mode=log-only → 仅 ctx.logger.info 输出结论，不落盘
       ▼
-可见性：chokidar watcher 自动 invalidate（~200ms）→ 下一会话 pre-step 可见
+可见性：skill 走 chokidar watcher 自动 invalidate（~200ms）→ 下一会话 pre-step 可见；
+        memory 走 systemPrompt.context() 快照投影——变更随下一个模型步注入当前会话（§12.2）
 ```
 
 **与 Hermes 的关键差异（有意为之）**：
-- **review agent 零工具**（Hermes 给它 memory+skill_manage 两个写入口）。dsh 侧改为：既有 skill 清单经 `ctx.skills.snapshot()` 注入 prompt，review agent 只输出结构化 JSON 结论，写入由插件代码执行。守卫更硬、审批更容易做，代价是失去 Hermes 的"review 中多轮检索 skill 全文"能力（v1 接受；v3 可给 review agent 只读的 skill 工具）。
+- **review agent 零工具**（Hermes 给它 memory+skill_manage 两个写入口）。dsh 侧改为：既有 skill 清单经 `ctx.skills.snapshot()` 注入 prompt，review agent 只输出结构化 JSON 结论，写入由插件代码执行。守卫更硬、审批更容易做，代价是失去 Hermes 的"review 中多轮检索 skill 全文"能力（v1 接受；v3 可给 review agent 只读的 skill 工具）。v0.5 起 memory 出口恢复——仍是零工具，双结论协议里多一个 `memory` 字段，写入照旧由插件代码执行（§12）。
 - **触发阈值由代码实现**（Hermes 也是代码触发 + LLM 评估，这一点同构）。
 
 ## 3. 触发策略（对齐 Hermes turn_finalizer）
@@ -122,7 +123,7 @@ skill writer
    - 负面清单五条：环境故障、对工具的负面断言、已自愈的暂时错误、一次性任务叙事、未解决的失败；
    - 四级优先序：PATCH 会话内已加载的 → PATCH 既有 umbrella → umbrella 下加 references → 才 CREATE；
    - 命名纪律：class-level，禁止 PR 号/错误串/一次性代号；"名字只对今天的任务有意义就是错的"；
-   - memory/skill 分工：流程进 skill；用户画像类本轮不沉淀（v1 不做 memory）。
+   - memory/skill 分工：流程进 skill；环境/项目事实与用户画像 → memory 双库（v0.5 §12。v0.1–v0.4 阶段此条为"用户画像类本轮不沉淀"）。
 2. **既有 skill 清单**：`ctx.skills.snapshot()` 渲染为 `- name: description` 列表（这正是模型在会话里看到的同一份目录，判定"该 patch 谁"的依据）。
 3. **疑似相关 skill 全文**（patch 可行性的前提）：runner 从清单中按转写关键词/名称相似度匹配 top-N（默认 3）疑似相关 skill，读取其 SKILL.md 全文注入。patch 动作要求结论里的 `body` 基于目标正文修改，看不到全文就写不出正确的 patch——§2 架构图、本节、§6 守卫三处共享同一次读取（读取时同步计算 `baseHash` 供 writer 做 CAS，见 §6）。
 4. **会话转写尾部**：`session.deriveMessages()` 末尾 N 条，超长按 `maxTranscriptChars` 截断（保尾不保头——结论和纠正通常在尾部）。
@@ -136,10 +137,16 @@ skill writer
   "body": "完整 SKILL.md body（不含 frontmatter）",  // create/patch 必填
   "baseHash": "sha256(注入时的目标 SKILL.md 全文)",  // patch 必填——CAS 用（§6），runner 注入 suspects 全文时同步计算并随 prompt 给出
   "baseDescription": "注入时的目标 description 快照", // patch 必填——writer 校验 frontmatter 未被改过
-  "rationale": "为什么值得/不值得存" }
+  "rationale": "为什么值得/不值得存",
+  "memory": {                          // v0.5 可选字段（§12.3）——缺省/解析失败按 nothing 处理
+    "action": "nothing" | "add" | "replace" | "remove",
+    "store": "memory" | "user",
+    "text": "新条目全文（add/replace 必填）",
+    "oldText": "唯一命中一个既有条目的子串（replace/remove 必填）",
+    "rationale": "为什么值得记/改/删" } }
 ```
 
-解析失败 / 非法 action / name 不合 kebab-case → 记日志丢弃（fail-closed）。
+解析失败 / 非法 action / name 不合 kebab-case → 记日志丢弃（fail-closed）；`memory` 子结论的失败**不连坐** skill 结论，两条通道独立守卫、独立落盘（§12.4）。
 
 ### 硬化措施
 
@@ -177,7 +184,7 @@ skill writer
 
 ## 7. 范围与配置
 
-**v1 范围**：skill 沉淀全链路（触发→review→写入→可见）。**不做**：memory 层（dsh 的 memory 机制另行调研）、FTS 会话回查、Curator、审批 UI。
+**v1 范围**：skill 沉淀全链路（触发→review→写入→可见）。**不做**：memory 层（dsh 的 memory 机制另行调研——已完成并于 v0.5 立项，见 §12）、FTS 会话回查、Curator、审批 UI。
 
 配置（ctx.settings + zod，对齐 Hermes config_defaults）：
 
@@ -198,6 +205,11 @@ hermes-loop:
   curatorStaleDays: 30
   curatorArchiveDays: 90
   curatorIntervalHours: 24
+  # ── Memory 通道（§12，v0.5）──
+  memoryEnabled: true        # MEMORY.md：环境/项目事实、约定、教训
+  userProfileEnabled: true   # USER.md：画像/偏好；两开关全关 → 协议退回 skill 单结论
+  memoryCharLimit: 2200      # 对齐 Hermes 原版（≈800 tok）
+  userCharLimit: 1375        # ≈500 tok
 ```
 
 ## 8. 风险与残余问题
@@ -222,7 +234,8 @@ hermes-loop:
   - **P1**：① suspect 的 baseDescription 曾用目录截断值做 CAS 基准——description 超 500 字符的技能永远无法 patch（改从文件全文取完整值）；② usage.json 加载竞态——flush 加 usageReady 门（加载完成前绝不写盘）+ 加载回调改合并语义（计数相加、时间戳取新、curator 记录内存优先）；③ 全局串行队列微任务缺口——三处启动路径改同步直调（running 同调用栈置位）；
   - **P2**：Curator 巡检应用转移前重查当前状态（手动 restore 优先）+ `archive ≥ stale+1` 运行时钳位；dispose 无条件冲洗；activity.jsonl 超 512KB 滚动截断（保留尾 2000 行）；windows 会话状态 7 天淘汰（随每小时定时器）；巡检定时器 1h 一醒（间隔交给 `curatorIntervalHours` 门控）；项目级技能不再进 suspects（writer 只认全局库，注入必然 patch-missing）；description 超长截断而非丢弃整条结论；settings 缺席时的回退 patch 走 `sanitizeSettingsPatch` 校验（非法 mode 不再静默落入 auto 直写）；
   - **客户端**：savePatch 检查 HTTP 状态（失败显示"保存失败"而非假"已保存"）；reviewNow 404/错误有可见反馈；usage 表头修正为"技能"；信号徽标 kind 本地化；usage.rows 缺失防御。
-- **v0.3（防碎片化）**：~~疑似相关 skill 全文注入~~（提前至 v0.1 完成）；**Curator 纯代码退休 pass ✅（设计见 §10）**——墙钟差值 + 惰性求值的三态状态机（active↔stale→archived；归档=翻 `disable-model-invocation`，永不删除；纳管事实依据统一为 activity.jsonl 的 write-outcome:created 账本，加载时回填存量）；**信号加速触发 ✅（设计见 §11）**——abort/工具失败突发/纠正词三类信号命中即跳过阈值提前复盘，冷却仍生效，词表面板可改、命中率面板度量。候选新增：**memory 通道**（dsh 无原生 memory 机制；Hermes 原版 review 本就 memory+skill 合体，触发/守卫全复用；待出设计补充——载体 `~/.dsh/memory/MEMORY.md`、双结论协议、systemPrompt 注入）。
+- **v0.3（防碎片化）**：~~疑似相关 skill 全文注入~~（提前至 v0.1 完成）；**Curator 纯代码退休 pass ✅（设计见 §10）**——墙钟差值 + 惰性求值的三态状态机（active↔stale→archived；归档=翻 `disable-model-invocation`，永不删除；纳管事实依据统一为 activity.jsonl 的 write-outcome:created 账本，加载时回填存量）；**信号加速触发 ✅（设计见 §11）**——abort/工具失败突发/纠正词三类信号命中即跳过阈值提前复盘，冷却仍生效，词表面板可改、命中率面板度量。候选新增：**memory 通道 → 已立项为 v0.5，设计见 §12**（dsh 无原生 memory 机制；Hermes 原版 review 本就 memory+skill 合体，触发/守卫全复用；注入通道经 2026-09-01 平台实证改走 `systemPrompt.context()` 动态上下文，优于最初设想的 section 注入）。
+- **v0.5（memory 通道，2026-09-01 立项）**：复盘恢复 Hermes 的 memory+skill 合体——双结论协议（§12.3）、`~/.dsh/memory/{MEMORY,USER}.md` 双库、四条写入守卫（§12.4）、`systemPrompt.context()` 快照注入（§12.2）。设计见 §12。
 
 ## 10. Curator 设计（v0.3 补充，2026-08-29）
 
@@ -314,3 +327,68 @@ curatorIntervalHours: 24  # 自动巡检的最小间隔；手动按钮不受限
 ### 命中率度量（不做自动调节）
 
 review-start 审计事件带 `signal` 字段；status 快照的 `signals` 节聚合近期（activity 尾 60 行）：各类型信号数、信号触发的复盘数、其中产出沉淀的复盘数。词表太宽/太窄由人看数据判断，系统不自调——诚实且可解释。
+
+## 12. Memory 通道（v0.5 补充，2026-09-01）
+
+> 立项动机：Hermes 原版复盘本就 memory+skill 合体（research §1/§2/§4），v0.1 有意砍掉了 memory 半边。补上它不需要任何新触发/队列/审批设施——同一次复盘多出一个结论出口。**2026-09-01 注入通道平台实证**（dsh 0.1.1-rc.2 安装包；v2 写作时引用的 monorepo 已不在本地，以下引用 `node_modules/@deepseek-ai/` 下的编译产物路径与行号）。
+
+### 12.1 定位与分工（对齐 research §2/§4）
+
+> "Memory captures 'who the user is and what the current situation and state of your operations are'; skills capture 'how to do this class of task for this user'."
+
+| 库 | 载体 | 收什么 | 不收什么 |
+|---|---|---|---|
+| MEMORY.md | `~/.dsh/memory/MEMORY.md` | 环境/项目事实、约定、教训（"npm publish 必须 OTP""web 跑在 19080"） | 流程步骤（→ skill） |
+| USER.md | `~/.dsh/memory/USER.md` | 用户画像、偏好、对 agent 行为方式的期望 | 一次性任务偏好 |
+
+"流程 → skill"的分界不变，memory 只接事实与画像。目录尊重 `DSH_HOME`（复用 dshHome()，与 skills/pending 同一套根解析）；条目以 `§ ` 前缀行分隔（Hermes 同款，人可直接读改）。
+
+### 12.2 注入通道：systemPrompt.context()（本设计的核心决定）
+
+**不用 section()，用 context()（动态运行时上下文）**。实证链：
+
+1. `assemble()` 在**每个模型步的 preStep 里执行**（dsh-agent-loop/lib/index.js:492-505 → dsh-system-prompt/lib/index.js:240）；section 与 context 的 `text` 都**可以是函数，逐步重新求值**（dsh-system-prompt/lib/index.js:271、278）；
+2. context 渲染为运行时上下文快照，头部固定 "Current runtime context. This snapshot supersedes earlier runtime-context snapshots."（:87），经 RuntimeContextProjection.project() 以 `user/message`（source.kind=plugin、form=snapshot）并入当步消息（dsh-agent-loop/lib/index.js:63-80）——**文本与上次保留值相同就不追加任何消息**（delta 投影；由无到有、由有到无各有一条边界消息）。
+
+由此得到比 Hermes 冻结快照更优的性质：
+
+- **静止期零成本**：函数每次返回同一文本 → project() 判等 → 不追加消息；system prompt 恒定 → prefix cache 表现与 v0.1 完全一致；
+- **变更当场可见**：复盘写入记忆 → 下一步 assemble 读到新文本 → 追加一条快照消息，**模型当步可见，无需等下个会话**（Hermes 只能下会话生效；快照头自带"以最新快照为准"的指令）；
+- **文件即界面**：每步重读文件，用户手改 MEMORY.md 自动可见，无需 watcher、无需 API。
+
+注册：`ctx.systemPrompt.context({ name: 'hermes:memory', order: 40, text: () => renderMemoryContext() })`。同层同名抛错（dsh-system-prompt/lib/index.js:142-143）——与 §5 的 loop-aware section（order 51、section 通道）不同名不同通道，无冲突。渲染格式：分库小节，库头部含 字符数/上限与条目数（面板用量同源），条目 `§ ` 分隔；**两库全空返回 `''`**（renderContextSections 过滤空文本，快照整体不出现，与会话启动前无记忆的干净状态一致）。
+
+**text 函数绝不允许抛错**——assemble 在每个模型步的关键路径上。读文件失败（权限/IO）返回进程内上次成功快照或空串 + `logger.warn` 降级，绝不让一次文件故障打死所有会话。文件 ≤2KB，每步 readFileSync 成本可忽略；写入走原子 rename，读者只见旧或新、绝不见半截。快照消息 source.kind=plugin，天然不会被 §3 的触发计数和 §11 的纠正词误捕（kind=user 才计）。
+
+### 12.3 双结论协议（向后兼容）
+
+fenced JSON 增加可选 `memory` 字段（协议见 §4.2；缺字段/解析失败按 nothing 处理，fail-closed；v0.4 的模型与旧 prompt 不受影响）。一次复盘至多一条 memory 结论——Hermes 的 fork 可多轮调用工具，我们是零工具单结论；触发频率（每 10 turn + 信号加速）下单条够用，碎片化真实出现再升数组。`memoryEnabled` 与 `userProfileEnabled` **全关时不注入 memory 问题，协议退回 skill 单结论**（对齐 Hermes"两开关全关 = memory 工具整个消失"）。
+
+**memory 结论按需产出——多数复盘应该是 nothing，不是每次复盘都要写记忆。** 这是与 skill 通道刻意的不对称：skill prompt 保留 Hermes 的主动倾向（"什么都不做不是中性结果"），memory 不给主动倾向——Hermes 原版亦然，其 memory review 的合法出口就是 "Nothing to save."（research §5），代码层也没有"该存未存"的告警。理由：记忆库是小限额的精编清单（2200+1375 字符），平庸条目会挤掉真条目，而漏记几乎零成本——内容若真重要，下轮复盘还会遇到。prompt 写明：没有明确值得记的就省略 memory 字段或置 `action: "nothing"`，不为写而写。
+
+review prompt 增补（恢复 Hermes memory review 原题，research §5）：用户暴露了什么画像/偏好/对你行为方式的期望（→ USER.md）；环境/项目事实、约定、教训（→ MEMORY.md）；流程步骤坑（→ skill，原有规则不动）。限额压力写进 prompt：**库接近上限时优先 replace（合并改写既有条目）或 remove（删过时条目）而非 add**——Hermes 让 fork 当场自合并，我们零工具单结论，用"声明式合并"达到同一效果。
+
+### 12.4 写入守卫
+
+- **执行位置**：memory writer 与 skill writer 同在 §3.6 全局串行队列内顺序执行——插件内无并发，整文件重写天然免 CAS；
+- **① 去重**：add 前规范化空白比对，已存在完全相同条目 → 拒绝（Hermes "no duplicate added" 同款）；
+- **② 扫描**：条目含不可见 Unicode（U+200B–200F / 202A–202E / 2060–2064 / FEFF）或控制字符（\n\t 除外）→ 拒绝；命中凭据样式（`sk-` 长串、`PRIVATE KEY` 头、`password=` 等）→ 拒绝并 warn。语义级注入/外泄判断仍交给 prompt 负面清单——代码只拦便宜的；
+- **③ 限额**：写入后总字符超 `memoryCharLimit`/`userCharLimit` → **只拒 memory 结论，不连坐 skill 结论**；拒绝经回显与面板可见，等用户剪枝或下轮 replace/remove；
+- **④ 定位**：replace/remove 的 oldText 必须恰好命中一个条目，0 或 ≥2 命中 → 拒绝（防误删）；
+- **写入**：读当前文件 → 整文件重排 → atomicWrite（复用 §6 原子写）。用户手改由"写入前重读"自愈；多进程并发残险同 §8.3，接受；
+- **mode**：`auto` 直接落盘；`approval` 并入 pending JSON，人工批 = 把 text 手动加进对应文件（一条一行，远轻于批整个 SKILL.md）；`log-only` 只日志；
+- **审计与回显**：activity.jsonl 记 `memory-outcome`（store/action/chars，账本纪律对齐 §10.3）；既有 review 回显行追加 memory 摘要（如 "🧠 memory +1（1204/2200）"）。
+
+### 12.5 状态与面板
+
+- status 快照新增 `memory` 节：`{ stores: { memory: { chars, limit, entries, lastWriteAt }, user: { … } }, lastOutcome }`——数据来自注入函数的同一份进程内缓存，零额外 IO；
+- 面板新增"记忆"卡：两库用量条（chars/limit）、条目数、文件路径提示（手改即生效，下个模型步可见）。**不做编辑 API**——文件即界面，与"手改 SKILL.md"同哲学；
+- 不做 `/journey` 式时间线：单库 ≤2200 字符，肉眼可管。
+
+### 12.6 明确不做与残余问题
+
+- **无 read 工具、无检索**：记忆全量注入（上限 2200+1375 字符），装不下的历史交给 FTS 会话回查（仍在 v1 不做清单，另行立项）；
+- **外部记忆 provider（Mem0/Honcho 等 8 家）**：dsh 无 provider 插槽，等真实需求；
+- **长会话快照堆积**：每次变更追加一条快照消息，多次写入留多条历史快照——单条 ≤4KB，且会话有 compaction 兜底，接受；
+- **runtimeContextSuppressed**：任何插件注册 suppressor 会整体关闭动态上下文（含本通道与时间上下文）——宿主级行为，不在插件侧防御；
+- **单结论单 op**：v0.5 简化；出现真实碎片化后升数组或仿 §10 加纯代码 Curator pass。

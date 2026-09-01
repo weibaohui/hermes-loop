@@ -87,6 +87,12 @@ window.__ModuleLoader__.load({
         'signal.kind.abort': '中断',
         'signal.kind.tool-failure': '工具失败',
         'signal.kind.correction': '纠正词',
+        memory: '记忆（跨会话）',
+        'memory.help': '后台复盘按需写入的长期记忆：MEMORY 存环境/项目事实、约定与教训，USER 存用户画像与偏好。记忆全文随运行时上下文注入每个对话，写入或手改文件后下一个模型步即生效——多数复盘不会产生记忆，不为写而写。手动维护直接改文件即可：' + '~/.dsh/memory/。',
+        'memory.entries': '条',
+        'memory.disabled': '已关闭',
+        'memory.empty': '两个记忆库都是空的 —— 复盘发现值得长期记住的事实/偏好时会出现在这里',
+        'memory.lastWrite': '最近写入',
       },
       en: {
         tab: 'Hermes Loop',
@@ -160,6 +166,12 @@ window.__ModuleLoader__.load({
         'signal.kind.abort': 'abort',
         'signal.kind.tool-failure': 'tool failures',
         'signal.kind.correction': 'correction',
+        memory: 'Memory (cross-session)',
+        'memory.help': 'Long-term memory written on demand by background reviews: MEMORY holds environment/project facts, conventions and lessons; USER holds user profile and preferences. The full content is injected into every conversation via the runtime-context snapshot — writes (or hand edits of the file) take effect at the next model step. Most reviews produce no memory. Edit files directly under ' + '~/.dsh/memory/.',
+        'memory.entries': ' entries',
+        'memory.disabled': 'off',
+        'memory.empty': 'Both memory stores are empty — facts/preferences worth remembering will land here when a review spots them',
+        'memory.lastWrite': 'last write',
       },
     }
 
@@ -524,6 +536,44 @@ window.__ModuleLoader__.load({
                             : null))
                     }))))
                 : h('div', { className: 'hl-mut' }, t('curator.empty')))
+          })(),
+
+          // 记忆（跨会话）：双库用量条 + 条目数（§12.5；文件即界面，不做编辑 API）
+          (function () {
+            var mem = data.memory || { stores: {} }
+            var stores = mem.stores || {}
+            var rows = ['memory', 'user'].map(function (key) {
+              var st = stores[key] || {}
+              return {
+                key: key,
+                label: key === 'user' ? 'USER' : 'MEMORY',
+                on: st.enabled !== false,
+                chars: st.chars || 0,
+                limit: st.limit || 0,
+                entries: st.entries || 0,
+                lastWriteAt: st.lastWriteAt,
+              }
+            })
+            var totalEntries = rows.reduce(function (n, r) { return n + r.entries }, 0)
+            return h('div', { className: 'hl-card' },
+              h('h3', null, t('memory'), ' ',
+                h('span', { className: 'hl-help', 'data-tip': t('memory.help') }, '?'),
+                mem.lastOutcome && mem.lastOutcome.at
+                  ? h('span', { className: 'hl-mut', style: { fontWeight: 400, textTransform: 'none', letterSpacing: 0 } },
+                    ' — ' + t('memory.lastWrite') + ' ' + fmtDate(mem.lastOutcome.at) + ' ' + (mem.lastOutcome.result || ''))
+                  : null),
+              rows.map(function (r) {
+                var p = r.limit > 0 ? pct(r.chars, r.limit) : 0
+                return h('div', { className: 'hl-row', key: r.key, style: r.on ? null : { opacity: .5 } },
+                  h('span', { className: 'hl-mut', style: { minWidth: '52px' } }, r.label),
+                  r.on
+                    ? [
+                      h('div', { className: 'hl-bar' + (p >= 100 ? ' warn' : '') }, h('i', { style: { width: p + '%' } })),
+                      h('span', { className: 'hl-num' }, r.chars + ' / ' + r.limit + ' · ' + r.entries + t('memory.entries')),
+                    ]
+                    : h('span', { className: 'hl-mut' }, t('memory.disabled')))
+              }),
+              totalEntries === 0 ? h('div', { className: 'hl-mut' }, t('memory.empty')) : null)
           })(),
         )
       }

@@ -6,16 +6,19 @@
  * Subscribes to every session's `session/event` stream, counts completed
  * turns / tool calls per session, and when a threshold fires runs a
  * zero-tool background review agent over the transcript tail. The review
- * returns a fenced-JSON conclusion {action: nothing|create|patch, ...} and
- * this plugin (never the agent) writes the skill into the user library.
+ * returns a fenced-JSON conclusion {action: nothing|create|patch, ...} with
+ * an optional on-demand `memory` sub-conclusion, and this plugin (never the
+ * agent) writes the skill / memory entries to disk. Memory is injected back
+ * through `systemPrompt.context()` — the delta-projected runtime snapshot.
  *
- * Design doc: hermes-loop/docs/design-dsh.md (v2.1). v0.1 scope:
+ * Design doc: hermes-loop/docs/design-dsh.md (v2.1, memory §12). v0.1 scope:
  * auto/log-only modes end-to-end, global skill dir only, approval stages a
  * pending JSON (UI arrives with v0.2 in skills-management).
  */
 
 const { createHash, randomUUID } = require('node:crypto')
 const fsP = require('node:fs/promises')
+const fs = require('node:fs')
 const { join, resolve, sep } = require('node:path')
 const { homedir } = require('node:os')
 // settings 服务要求 schemastery schema（需要可调用校验 + toJSON，zod 不兼容）。
@@ -44,6 +47,14 @@ const BODY_MAX_CHARS = 128 * 1024
 const SUSPECT_BODY_MAX_CHARS = 8 * 1024
 const TRANSCRIPT_MESSAGE_CAP = 40
 const TRANSCRIPT_MESSAGE_CHARS = 4000
+// ── Memory 通道（design §12，v0.5）──
+const MEMORY_ENTRY_MAX_CHARS = 500
+const MEMORY_STORES = ['memory', 'user']
+// 不可见 Unicode 与控制字符（\n\t 除外）：prompt 注入的常见载体，代码只拦便宜的
+const MEMORY_INVISIBLE_RE = /[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF]/
+const MEMORY_CONTROL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/
+// 凭据样式：条目里出现即拒绝（语义级判断仍交给 review prompt 的负面清单）
+const MEMORY_CREDENTIAL_RE = /(sk-[A-Za-z0-9_-]{16,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:password|passwd|api[_-]?key|apikey|secret|token)\b\s*[=:]\s*\S+)/i
 
 /**
  * Audit/activity trail: append one JSON line per loop event to
@@ -97,6 +108,11 @@ const DEFAULTS = {
   signalToolFailureMin: 3,   // 窗口内 tool/result 失败 ≥N 次 → 加速（0=关）
   // 内置中英默认词表；用户可在面板/settings.yaml 整体改写（逗号分隔，全量替换）
   signalCorrectionWords: '不对,错了,重来,别这样,应该是,你弄错了,wrong,try again,not what i,stop doing',
+  // ── Memory 通道（design §12，v0.5）──
+  memoryEnabled: true,        // MEMORY.md：环境/项目事实、约定、教训
+  userProfileEnabled: true,   // USER.md：画像/偏好；两开关全关 → 协议退回 skill 单结论
+  memoryCharLimit: 2200,      // 对齐 Hermes 原版（≈800 tok）
+  userCharLimit: 1375,        // ≈500 tok
 }
 
 function settingsSchema() {
@@ -121,6 +137,10 @@ function settingsSchema() {
     signalTriggerEnabled: Schema.boolean().default(true),
     signalToolFailureMin: Schema.number().min(0).default(3),
     signalCorrectionWords: Schema.string().default('不对,错了,重来,别这样,应该是,你弄错了,wrong,try again,not what i,stop doing'),
+    memoryEnabled: Schema.boolean().default(true),
+    userProfileEnabled: Schema.boolean().default(true),
+    memoryCharLimit: Schema.number().min(200).default(2200),
+    userCharLimit: Schema.number().min(200).default(1375),
   })
 }
 
@@ -133,6 +153,9 @@ function globalSkillsDir() {
 }
 function pendingDir() {
   return join(dshHome(), 'hermes-loop', 'pending')
+}
+function memoryDir() {
+  return join(dshHome(), 'memory')
 }
 
 // ── Pure helpers (unit-tested via __internals) ──────────────────────────
@@ -224,8 +247,35 @@ function extractFencedJson(text) {
 }
 
 /**
+ * memory 子结论解析（design §12.3，向后兼容）：字段缺席/畸形一律返回 undefined，
+ * 只丢 memory 通道、绝不连坐 skill 结论（fail-closed 按通道隔离）。
+ */
+function parseMemoryConclusion(raw) {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+  if (!['nothing', 'add', 'replace', 'remove'].includes(raw.action)) return undefined
+  if (raw.action === 'nothing') return { action: 'nothing', rationale: typeof raw.rationale === 'string' ? raw.rationale : '' }
+  if (raw.store !== 'memory' && raw.store !== 'user') return undefined
+  // oldText 只约束 replace/remove（add 不需要定位既有条目）
+  if (raw.action === 'replace' || raw.action === 'remove') {
+    if (typeof raw.oldText !== 'string' || raw.oldText.trim() === '') return undefined
+  }
+  // add/replace 带正文：非空校验 + 截断（description 截断同款——模型对字符数估计
+  // 有系统性偏差，一条其余全合法的结论不该因略长蒸发）
+  let text
+  if (raw.action === 'add' || raw.action === 'replace') {
+    if (typeof raw.text !== 'string' || raw.text.trim() === '') return undefined
+    text = raw.text.trim().slice(0, MEMORY_ENTRY_MAX_CHARS)
+  }
+  const out = { action: raw.action, store: raw.store, oldText: raw.oldText, rationale: typeof raw.rationale === 'string' ? raw.rationale : '' }
+  if (text !== undefined) out.text = text
+  return out
+}
+
+/**
  * Parse a review conclusion. Anything malformed → undefined (fail-closed:
- * the caller logs and drops, per design §4).
+ * the caller logs and drops, per design §4). The optional `memory` field is
+ * validated independently: a malformed memory sub-conclusion is dropped while
+ * the skill conclusion survives (per-channel fail-closed, design §12.3).
  */
 function parseConclusion(text) {
   const jsonText = extractFencedJson(text)
@@ -234,7 +284,12 @@ function parseConclusion(text) {
   try { parsed = JSON.parse(jsonText) } catch { return undefined }
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined
   if (!['nothing', 'create', 'patch'].includes(parsed.action)) return undefined
-  if (parsed.action === 'nothing') return { action: 'nothing', rationale: typeof parsed.rationale === 'string' ? parsed.rationale : '' }
+  const memory = parseMemoryConclusion(parsed.memory)
+  if (parsed.action === 'nothing') {
+    const out = { action: 'nothing', rationale: typeof parsed.rationale === 'string' ? parsed.rationale : '' }
+    if (memory !== undefined) out.memory = memory
+    return out
+  }
   if (typeof parsed.skill !== 'string' || !KEbab_NAME_RE.test(parsed.skill)) return undefined
   if (typeof parsed.body !== 'string' || parsed.body.trim() === '' || parsed.body.length > BODY_MAX_CHARS) return undefined
   const conclusion = { action: parsed.action, skill: parsed.skill, body: parsed.body, rationale: typeof parsed.rationale === 'string' ? parsed.rationale : '' }
@@ -250,6 +305,7 @@ function parseConclusion(text) {
     conclusion.baseHash = parsed.baseHash
     if (typeof parsed.baseDescription === 'string') conclusion.baseDescription = parsed.baseDescription
   }
+  if (memory !== undefined) conclusion.memory = memory
   return conclusion
 }
 
@@ -381,6 +437,142 @@ function matchCorrectionWord(text, words) {
   return words.find((w) => hay.includes(w))
 }
 
+// ── Memory 通道（design §12，v0.5）──────────────────────────────────────
+// 载体 ~/.dsh/memory/{MEMORY,USER}.md，条目一行一条、`§ ` 前缀（Hermes 同款，
+// 人可直接读改——每步重读文件，手改下一个模型步即见）。四个守卫全部纯函数化。
+
+const memoryStoreFile = (store) => join(memoryDir(), store === 'user' ? 'USER.md' : 'MEMORY.md')
+const memoryStoreEnabled = (store, eff) => (store === 'user' ? eff.userProfileEnabled : eff.memoryEnabled) !== false
+const memoryStoreLimit = (store, eff) => (store === 'user' ? eff.userCharLimit : eff.memoryCharLimit)
+
+/** 去重/比较用的规范化：连续空白折叠成单空格。 */
+function normalizeEntry(text) {
+  return String(text || '').replace(/\s+/g, ' ').trim()
+}
+
+/** 解析记忆文件：`§` 前缀行是条目，其余（标题/空行/手写注释）忽略。 */
+function parseMemoryEntries(raw) {
+  const out = []
+  for (const line of String(raw || '').split(/\r?\n/)) {
+    const m = line.match(/^§\s?(.*)$/)
+    if (m === null) continue
+    const text = m[1].trim()
+    if (text !== '') out.push(text)
+  }
+  return out
+}
+
+/** 序列化：标准标题 + `§ ` 行。条目内换行折叠成空格，保持一行一条。 */
+function serializeMemoryEntries(store, entries) {
+  const title = store === 'user' ? 'USER' : 'MEMORY'
+  const body = entries.map((e) => '§ ' + normalizeEntry(e)).join('\n')
+  return `# ${title}\n\n${body}${body === '' ? '' : '\n'}`
+}
+
+const memoryCharsOf = (entries) => entries.reduce((n, e) => n + e.length, 0)
+
+/**
+ * 条目内容扫描：返回拒绝理由，null=放行。只拦代码层便宜的：
+ * 不可见 Unicode / 控制字符（prompt 注入载体）、凭据样式（防复盘把密钥记进永久记忆）。
+ */
+function scanMemoryEntry(text) {
+  if (MEMORY_INVISIBLE_RE.test(text)) return 'invisible-unicode'
+  if (MEMORY_CONTROL_RE.test(text)) return 'control-char'
+  if (MEMORY_CREDENTIAL_RE.test(text)) return 'credential-pattern'
+  return null
+}
+
+/**
+ * 纯函数四条守卫（design §12.4 ①去重 ②扫描 ③限额 ④oldText 唯一定位）：
+ * 输入当前条目与 memory 子结论，返回应用后的条目数组——不做任何 I/O。
+ * @returns {ok: true, result: 'added'|'replaced'|'removed', entries, chars}
+ *        | {ok: false, result: 'rejected', reason, detail}
+ */
+function planMemoryChange(entries, mem, { limit }) {
+  const current = Array.isArray(entries) ? entries : []
+  const used = memoryCharsOf(current)
+  if (mem.action === 'add') {
+    const text = normalizeEntry(mem.text)
+    if (text === '') return { ok: false, result: 'rejected', reason: 'empty-text' }
+    if (current.some((e) => normalizeEntry(e) === text)) {
+      return { ok: false, result: 'rejected', reason: 'duplicate', detail: 'identical entry already exists' }
+    }
+    const scan = scanMemoryEntry(text)
+    if (scan !== null) return { ok: false, result: 'rejected', reason: scan, detail: 'entry content rejected by scanner' }
+    const chars = used + text.length
+    if (chars > limit) {
+      return { ok: false, result: 'rejected', reason: 'over-limit', detail: `${chars}/${limit} chars — merge or remove via replace/remove instead of add` }
+    }
+    return { ok: true, result: 'added', entries: [...current, text], chars }
+  }
+  // replace/remove 共用 oldText 唯一定位：0 命中=missing，≥2 命中=ambiguous
+  const needle = String(mem.oldText || '')
+  const hits = []
+  current.forEach((e, i) => { if (needle !== '' && e.includes(needle)) hits.push(i) })
+  if (hits.length === 0) return { ok: false, result: 'rejected', reason: 'old-text-missing', detail: 'oldText matches no entry' }
+  if (hits.length > 1) return { ok: false, result: 'rejected', reason: 'old-text-ambiguous', detail: `oldText matches ${hits.length} entries — include more context` }
+  if (mem.action === 'remove') {
+    const entries = current.filter((_, i) => i !== hits[0])
+    return { ok: true, result: 'removed', entries, chars: memoryCharsOf(entries) }
+  }
+  if (mem.action === 'replace') {
+    const text = normalizeEntry(mem.text)
+    if (text === '') return { ok: false, result: 'rejected', reason: 'empty-text' }
+    const scan = scanMemoryEntry(text)
+    if (scan !== null) return { ok: false, result: 'rejected', reason: scan, detail: 'entry content rejected by scanner' }
+    const entries = current.map((e, i) => (i === hits[0] ? text : e))
+    const chars = memoryCharsOf(entries)
+    if (chars > limit) {
+      return { ok: false, result: 'rejected', reason: 'over-limit', detail: `${chars}/${limit} chars after replace` }
+    }
+    return { ok: true, result: 'replaced', entries, chars }
+  }
+  return { ok: false, result: 'rejected', reason: 'unknown-action', detail: mem.action }
+}
+
+/**
+ * memory writer：读库 → 纯守卫 → 整文件重排 → 原子写。skill 结论与 memory 结论
+ * 同在全局串行队列内顺序执行（§3.6），插件内无并发，整文件重写免 CAS；
+ * 用户手改由"写入前重读"自愈。
+ * @returns {result, store, chars?, entries?, limit?, reason?, detail?}
+ */
+async function applyMemoryConclusion(mem, { dir = memoryDir(), limits = {}, enabled = {} } = {}) {
+  const store = mem.store
+  if (enabled[store] === false) return { result: 'store-disabled', store }
+  const file = join(dir, store === 'user' ? 'USER.md' : 'MEMORY.md')
+  const limit = limits[store]
+  let raw = ''
+  try { raw = await fsP.readFile(file, 'utf8') } catch { /* 新库：空文件起步 */ }
+  const plan = planMemoryChange(parseMemoryEntries(raw), mem, { limit })
+  if (!plan.ok) return { ...plan, store, limit }
+  await atomicWrite(file, serializeMemoryEntries(store, plan.entries))
+  return { result: plan.result, store, chars: plan.chars, entries: plan.entries.length, limit }
+}
+
+/**
+ * 渲染注入文本（design §12.2）。readRaw(store) 由调用方提供（同步读、缺文件返回 ''），
+ * 本函数只做渲染：两库全空/全关返回 ''（renderContextSections 会过滤空文本，快照整体
+ * 不出现）。库里容错：单库读取失败按空库渲染，不让一次 IO 故障扩散。
+ */
+function renderMemoryContext(eff, readRaw) {
+  const sections = []
+  for (const store of MEMORY_STORES) {
+    if (!memoryStoreEnabled(store, eff)) continue
+    let entries = []
+    try { entries = parseMemoryEntries(readRaw(store)) } catch { entries = [] }
+    if (entries.length === 0) continue
+    const chars = memoryCharsOf(entries)
+    const title = store === 'user' ? 'USER（用户画像/偏好）' : 'MEMORY（环境/项目事实/约定/教训）'
+    sections.push(`## ${title} — ${chars}/${memoryStoreLimit(store, eff)} 字符 · ${entries.length} 条\n${entries.map((e) => '§ ' + e).join('\n')}`)
+  }
+  if (sections.length === 0) return ''
+  return [
+    '# 长期记忆（跨会话持久，后台复盘按需维护；以下为最新全量快照）',
+    '',
+    sections.join('\n\n'),
+  ].join('\n')
+}
+
 /**
  * settings 服务缺席时 POST /settings 的回退校验：有 scope 走 schemastery 完整校验，
  * 没 scope 至少挡住非法枚举与越界数字——裸 Object.assign 会让 mode:'typo' 静默落入
@@ -412,6 +604,10 @@ function sanitizeSettingsPatch(patch) {
   if (typeof patch.signalTriggerEnabled === 'boolean') out.signalTriggerEnabled = patch.signalTriggerEnabled
   num('signalToolFailureMin', 0)
   if (typeof patch.signalCorrectionWords === 'string') out.signalCorrectionWords = patch.signalCorrectionWords
+  if (typeof patch.memoryEnabled === 'boolean') out.memoryEnabled = patch.memoryEnabled
+  if (typeof patch.userProfileEnabled === 'boolean') out.userProfileEnabled = patch.userProfileEnabled
+  num('memoryCharLimit', 200)
+  num('userCharLimit', 200)
   return out
 }
 
@@ -462,8 +658,24 @@ function curatorTransitions(records, usage, { now, staleDays, archiveDays }) {
 }
 
 // ── Review prompt (ported from Hermes _SKILL_REVIEW_PROMPT, design §4) ──
+// memory 增补段只在任一记忆库启用时出现（§12.3：两开关全关 = 协议退回 skill 单结论）。
 
-function reviewPrompt() {
+function reviewPrompt(eff = {}) {
+  const memoryOn = MEMORY_STORES.some((s) => {
+    const enabled = s === 'user' ? eff.userProfileEnabled : eff.memoryEnabled
+    return enabled !== false
+  })
+  const memorySection = memoryOn ? [
+    '',
+    '## 记忆（可选结论——多数复盘应该没有记忆）',
+    '除 skill 外，只有对话**明确暴露**了以下内容才考虑写记忆：',
+    '- 用户画像、偏好、对你行为方式的期望 → store="user"；',
+    '- 环境/项目事实、约定、教训（如"发布必须 OTP""服务跑在 19080 端口"）→ store="memory"；',
+    '- 流程、步骤、坑 → 仍归 skill，绝不写进记忆。',
+    '按需产出：没有明确值得记的就省略 memory 字段，不为写而写——记忆库是小限额精编清单，平庸条目会挤掉真条目，而漏记几乎零成本。',
+    '库接近上限时优先 replace（合并改写既有条目）或 remove（删过时条目），而不是 add。',
+    '',
+  ] : []
   return [
     '你是后台复盘 agent：分析一段刚结束的对话转写，判断其中有没有值得沉淀为 skill 的经验。',
     '',
@@ -491,9 +703,11 @@ function reviewPrompt() {
     '## 命名纪律',
     'kebab-case class-level 名字。禁止 PR 号、错误串、一次性代号（fix-X / debug-Y 之类）。',
     '如果名字只对今天的任务有意义，那就是错的——回到优先序 1/2 去扩写既有 skill。',
-    '',
+    ...memorySection,
     '## 分工',
-    '流程、步骤、坑 → skill。用户画像/偏好类信息本轮不沉淀。',
+    memoryOn
+      ? '流程、步骤、坑 → skill；环境事实/约定/教训与用户画像 → 记忆（规则见上）。'
+      : '流程、步骤、坑 → skill。用户画像/偏好类信息本轮不沉淀。',
     '',
     '## 输出协议（严格遵守）',
     '只输出一个 fenced JSON 代码块，不要输出其他任何文字：',
@@ -504,7 +718,16 @@ function reviewPrompt() {
     '  "body": "完整 SKILL.md 正文，不含 frontmatter",  // create/patch 必填',
     '  "baseHash": "<注入的 suspect baseHash 原样带回>",  // patch 必填',
     '  "baseDescription": "<注入的 suspect description 原样带回>",  // patch 必填',
-    '  "rationale": "一句话：为什么值得存/不值得存" }',
+    '  "rationale": "一句话：为什么值得存/不值得存",',
+    ...(memoryOn ? [
+      '  "memory": {                            // 可选；多数复盘应省略整个字段',
+      '    "action": "nothing" | "add" | "replace" | "remove",',
+      '    "store": "memory" | "user",           // add/replace/remove 必填',
+      '    "text": "新条目，一句话（add/replace 必填）",',
+      '    "oldText": "下方记忆条目里唯一命中一条的原文子串（replace/remove 必填）",',
+      '    "rationale": "为什么记/改/删" }',
+    ] : []),
+    '}',
     '```',
     'patch 时 body 必须基于注入的目标全文修改（保留正确内容，只改需要改的），不得凭空重写。',
     'body 章节规范：When to Use / Prerequisites / Procedure / Pitfalls / Verification。',
@@ -521,9 +744,12 @@ module.exports = {
   inject: ['skills', 'settings', 'agents', 'agentDefaultModel', 'systemPrompt', 'sessions'],
   __internals: {
     reasonKind, contentToText, renderTranscript, tokenize, rankSuspects,
-    extractFencedJson, parseConclusion, sha256, buildSkillMd, mergeFrontmatter, applyConclusion,
+    extractFencedJson, parseConclusion, parseMemoryConclusion, sha256, buildSkillMd, mergeFrontmatter, applyConclusion,
     descriptionOf, atomicWrite, DEFAULTS, dshHome, globalSkillsDir, pendingDir,
     setModelInvocation, curatorTransitions, parseCorrectionWords, matchCorrectionWord, sanitizeSettingsPatch,
+    memoryDir, memoryStoreFile, memoryStoreEnabled, memoryStoreLimit, normalizeEntry,
+    parseMemoryEntries, serializeMemoryEntries, scanMemoryEntry, planMemoryChange,
+    applyMemoryConclusion, renderMemoryContext,
   },
 
   apply(ctx, config = {}) {
@@ -576,6 +802,38 @@ module.exports = {
       } else {
         ctx.logger.info && ctx.logger.info('hermes-loop: skipping loop-aware section (hermes-prompt provides discipline)')
       }
+    }
+
+    // ── Memory 注入通道（design §12.2，v0.5）──
+    // 用 context()（动态运行时上下文）而非 section()：assemble 在每个模型步执行、
+    // text 可为函数逐步求值；RuntimeContextProjection 做 delta 投影——文本没变不追加
+    // 任何消息（prefix cache 无损），变了才追加一条快照 user/message 当步可见。
+    // text 函数在模型步关键路径上，绝不允许抛错：读库失败回退进程内上次成功快照。
+    if (ctx.systemPrompt && typeof ctx.systemPrompt.context === 'function') {
+      const memoryCache = { text: '', lastWarnAt: 0 }
+      ctx.effect(() => ctx.systemPrompt.context({
+        name: 'hermes:memory', // 同层同名抛错——本插件唯一的 context 名
+        order: 40,
+        text: () => {
+          try {
+            const eff = effective()
+            const next = renderMemoryContext(eff, (store) => {
+              try { return fs.readFileSync(memoryStoreFile(store), 'utf8') } catch { return '' }
+            })
+            memoryCache.text = next
+            return next
+          } catch (e) {
+            // 读盘/渲染故障：退回上次成功快照（可能为空串），限频告警防刷日志
+            const nowMs = Date.now()
+            if (nowMs - memoryCache.lastWarnAt > 60_000) {
+              memoryCache.lastWarnAt = nowMs
+              ctx.logger.warn(`hermes-loop: memory context render failed, serving last snapshot: ${e && e.message}`)
+            }
+            return memoryCache.text
+          }
+        },
+      }), 'hermes-loop: memory context')
+      ctx.logger.info && ctx.logger.info('hermes-loop: memory context registered (~/.dsh/memory/{MEMORY,USER}.md)')
     }
 
     // ── Trigger state ──
@@ -864,6 +1122,21 @@ module.exports = {
         const agent = handle.agent
         trace('review-agent-created', { reviewSession: agent.id })
 
+        // 3.5 当前记忆条目注入（§12.3）：replace/remove 的 oldText 定位与 add 去重都以它为基准
+        const memoryOn = MEMORY_STORES.some((s) => memoryStoreEnabled(s, eff))
+        let memoryBlock = ''
+        if (memoryOn) {
+          const storeParts = []
+          for (const store of MEMORY_STORES) {
+            if (!memoryStoreEnabled(store, eff)) continue
+            let raw = ''
+            try { raw = await fsP.readFile(memoryStoreFile(store), 'utf8') } catch { /* 新库 */ }
+            const entries = parseMemoryEntries(raw)
+            storeParts.push(`### ${store === 'user' ? 'USER' : 'MEMORY'}（${entries.length} 条）\n${entries.length > 0 ? entries.map((e) => '§ ' + e).join('\n') : '（空）'}`)
+          }
+          memoryBlock = '\n## 当前记忆条目（oldText 必须唯一命中某条原文；没有值得记的就省略 memory 字段）\n' + storeParts.join('\n\n')
+        }
+
         // 4. pump the final assistant message out of the session log
         const firstSeq = agent.session.seq
         let finalText = ''
@@ -895,9 +1168,10 @@ module.exports = {
         controller.signal.addEventListener('abort', onAbort, { once: true })
         try {
           const prompt = [
-            reviewPrompt(),
+            reviewPrompt(eff),
             '\n## 既有 skill 清单（name: description）\n' + catalogText,
             suspectBlocks.length > 0 ? '\n## 疑似相关 skill 全文\n' + suspectBlocks.join('\n\n---\n\n') : '',
+            memoryBlock,
             '\n## 会话转写（保尾截断）\n' + transcriptText,
           ].filter(Boolean).join('\n\n')
           agent.followup({ content: [{ type: 'text', text: prompt }], source: { kind: 'user' } })
@@ -922,8 +1196,18 @@ module.exports = {
           ctx.logger.warn(`hermes-loop: unparseable review conclusion for session ${sessionId}; dropped (fail-closed). head=${finalText.slice(0, 120).replace(/\s+/g, ' ')}`)
           return
         }
-        trace('conclusion', { sessionId, action: conclusion.action, skill: conclusion.skill, rationale: String(conclusion.rationale || '').slice(0, 300) })
-        if (conclusion.action === 'nothing') {
+        trace('conclusion', {
+          sessionId,
+          action: conclusion.action,
+          skill: conclusion.skill,
+          rationale: String(conclusion.rationale || '').slice(0, 300),
+          memory: conclusion.memory !== undefined && conclusion.memory.action !== 'nothing'
+            ? `${conclusion.memory.store}:${conclusion.memory.action}`
+            : undefined,
+        })
+        // skill=nothing 但 memory 有动作 → 照样进 dispatch（通道独立，§12.4 不连坐）
+        const hasMemoryAction = conclusion.memory !== undefined && conclusion.memory.action !== 'nothing'
+        if (conclusion.action === 'nothing' && !hasMemoryAction) {
           ctx.logger.info(`hermes-loop: review of session ${sessionId} → nothing. ${conclusion.rationale}`)
           return
         }
@@ -954,33 +1238,65 @@ module.exports = {
     }
 
     const dispatchConclusion = async (conclusion, { eff, sessionId, session }) => {
-      const logHead = `hermes-loop: ${conclusion.action} '${conclusion.skill}' (from session ${sessionId})`
-      trace('dispatch', { sessionId, mode: eff.mode, action: conclusion.action, skill: conclusion.skill })
+      const hasSkill = conclusion.action !== 'nothing'
+      const hasMemory = conclusion.memory !== undefined && conclusion.memory.action !== 'nothing'
+      const logHead = hasSkill
+        ? `hermes-loop: ${conclusion.action} '${conclusion.skill}' (from session ${sessionId})`
+        : `hermes-loop: memory ${conclusion.memory.action}@${conclusion.memory.store} (from session ${sessionId})`
+      trace('dispatch', {
+        sessionId, mode: eff.mode, action: conclusion.action, skill: conclusion.skill,
+        memory: hasMemory ? `${conclusion.memory.store}:${conclusion.memory.action}` : undefined,
+      })
       if (eff.mode === 'log-only') {
-        ctx.logger.info(`${logHead} — log-only mode, not written. ${JSON.stringify(conclusion)}`)
+        ctx.logger.info(`${logHead} — log-only mode, not written. ${JSON.stringify(hasSkill ? conclusion : conclusion.memory)}`)
         return
       }
       if (eff.mode === 'approval') {
         const dir = pendingDir()
-        const id = `${Date.now().toString(36)}-${conclusion.skill}`
-        const payload = { id, at: new Date().toISOString(), sourceSession: sessionId, mode: eff.mode, globalDir: globalSkillsDir(), conclusion }
+        // 纯记忆结论也有稳定的 pending 标识（skill 结论缺席时不留 undefined）
+        const label = hasSkill ? conclusion.skill : `memory-${conclusion.memory.store}`
+        const id = `${Date.now().toString(36)}-${label}`
+        const payload = { id, at: new Date().toISOString(), sourceSession: sessionId, mode: eff.mode, globalDir: globalSkillsDir(), memoryDir: memoryDir(), conclusion }
         await fsP.mkdir(dir, { recursive: true })
         await atomicWrite(join(dir, `${id}.json`), JSON.stringify(payload, null, 2))
         trace('staged', { id, dir, sessionId })
-        notifySourceSession(session, `后台复盘产出「${conclusion.skill}」已暂存待确认（mode=approval）：${conclusion.rationale || conclusion.action}`)
+        notifySourceSession(session, `后台复盘产出「${label}」已暂存待确认（mode=approval）：${(hasSkill ? conclusion.rationale : conclusion.memory.rationale) || conclusion.action}`)
         ctx.logger.info(`${logHead} — staged to ${dir} for approval`)
         return
       }
-      const outcome = await applyConclusion(conclusion, { globalDir: globalSkillsDir() })
-      trace('write-outcome', { sessionId, skill: conclusion.skill, ...outcome })
-      if (outcome.result === 'created' || outcome.result === 'patched') {
-        ctx.logger.info(`${logHead} — ${outcome.result} → ${outcome.path}`)
-        if (outcome.result === 'created') registerManaged(conclusion.skill) // 进入 Curator 纳管集（§10.3）
-        notifySourceSession(session, `后台复盘已${outcome.result === 'created' ? '新建' : '修补'}技能「${conclusion.skill}」，下一个会话即可使用${conclusion.rationale ? `：${conclusion.rationale}` : ''}`)
-      } else {
-        ctx.logger.warn(`${logHead} — ${outcome.result}. ${outcome.detail || ''}`)
-        if (outcome.result === 'cas-conflict' || outcome.result === 'create-conflict') {
-          notifySourceSession(session, `后台复盘想${conclusion.action === 'patch' ? '修补' : '新建'}技能「${conclusion.skill}」但被守卫拒绝（${outcome.detail || outcome.result}），本次未写入`)
+      // ── auto：skill 通道（memory 结论失败不连坐 skill，两通道独立守卫独立落盘）──
+      if (hasSkill) {
+        const outcome = await applyConclusion(conclusion, { globalDir: globalSkillsDir() })
+        trace('write-outcome', { sessionId, skill: conclusion.skill, ...outcome })
+        if (outcome.result === 'created' || outcome.result === 'patched') {
+          ctx.logger.info(`${logHead} — ${outcome.result} → ${outcome.path}`)
+          if (outcome.result === 'created') registerManaged(conclusion.skill) // 进入 Curator 纳管集（§10.3）
+          notifySourceSession(session, `后台复盘已${outcome.result === 'created' ? '新建' : '修补'}技能「${conclusion.skill}」，下一个会话即可使用${conclusion.rationale ? `：${conclusion.rationale}` : ''}`)
+        } else {
+          ctx.logger.warn(`${logHead} — ${outcome.result}. ${outcome.detail || ''}`)
+          if (outcome.result === 'cas-conflict' || outcome.result === 'create-conflict') {
+            notifySourceSession(session, `后台复盘想${conclusion.action === 'patch' ? '修补' : '新建'}技能「${conclusion.skill}」但被守卫拒绝（${outcome.detail || outcome.result}），本次未写入`)
+          }
+        }
+      }
+      // ── auto：memory 通道（§12.4）──
+      if (hasMemory) {
+        const mem = conclusion.memory
+        const outcome = await applyMemoryConclusion(mem, {
+          dir: memoryDir(),
+          limits: { memory: eff.memoryCharLimit, user: eff.userCharLimit },
+          enabled: { memory: eff.memoryEnabled !== false, user: eff.userProfileEnabled !== false },
+        })
+        trace('memory-outcome', { sessionId, store: mem.store, action: mem.action, result: outcome.result, reason: outcome.reason, chars: outcome.chars, entries: outcome.entries })
+        const memHead = `hermes-loop: memory ${mem.action}@${mem.store} (from session ${sessionId})`
+        const verb = { added: '写入', replaced: '改写', removed: '移除' }[outcome.result]
+        if (verb !== undefined) {
+          ctx.logger.info(`${memHead} — ${outcome.result} (${outcome.chars}/${outcome.limit} chars, ${outcome.entries} entries)`)
+          notifySourceSession(session, `后台复盘已${verb}记忆（${mem.store.toUpperCase()}，${outcome.chars}/${outcome.limit} 字符）${mem.rationale ? `：${mem.rationale}` : ''}`)
+        } else if (outcome.result === 'rejected') {
+          ctx.logger.warn(`${memHead} — rejected: ${outcome.reason}. ${outcome.detail || ''}`)
+        } else {
+          ctx.logger.warn(`${memHead} — ${outcome.result}`)
         }
       }
     }
@@ -1249,6 +1565,28 @@ module.exports = {
         counts: curatorCounts(),
         skills: curatorRows,
       }
+      // Memory 通道面板数据（§12.5）：双库用量走注入函数的同一读取路径；
+      // lastWriteAt/lastOutcome 从 activity 尾部取，不新增持久化状态
+      const memory = { stores: {} }
+      let lastMemoryOutcome
+      for (const e of activity) {
+        if (e.event === 'memory-outcome') lastMemoryOutcome = e
+      }
+      for (const store of MEMORY_STORES) {
+        let raw = ''
+        try { raw = await fsP.readFile(memoryStoreFile(store), 'utf8') } catch { /* 新库 */ }
+        const entries = parseMemoryEntries(raw)
+        memory.stores[store] = {
+          enabled: memoryStoreEnabled(store, eff),
+          chars: memoryCharsOf(entries),
+          limit: memoryStoreLimit(store, eff),
+          entries: entries.length,
+          lastWriteAt: lastMemoryOutcome && lastMemoryOutcome.store === store ? lastMemoryOutcome.at : undefined,
+        }
+      }
+      memory.lastOutcome = lastMemoryOutcome
+        ? { at: lastMemoryOutcome.at, store: lastMemoryOutcome.store, action: lastMemoryOutcome.action, result: lastMemoryOutcome.result, reason: lastMemoryOutcome.reason }
+        : undefined
       return {
         settings: eff,
         running: running !== null ? { sessionId: running.sessionId, startedAt: runningSince, preview: running.preview } : null,
@@ -1261,6 +1599,7 @@ module.exports = {
         usage: usageStats,
         curator,
         signals: signalStats,
+        memory,
       }
     }
 
