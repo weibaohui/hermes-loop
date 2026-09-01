@@ -1269,3 +1269,50 @@ test('GET status exposes memory stores (enabled/chars/limit/entries) and the las
     await rm(home, { recursive: true, force: true })
   }
 })
+
+test('v0.5 追加：默认纠正词表含「记住,记忆」持久化意图词，不含「总结」', () => {
+  const words = plugin.__internals.parseCorrectionWords(DEFAULTS.signalCorrectionWords)
+  assert.ok(words.includes('记住') && words.includes('记忆'))
+  assert.ok(!words.includes('总结'), '总结 too common — deliberately excluded')
+  assert.ok(!words.includes('wrong ') && words.includes('wrong'))
+})
+
+test('v0.5 追加：默认词表下「记住：X」命中信号提前复盘，「总结一下」不触发', async () => {
+  const fire1 = countingServices()
+  const t1 = setupPlugin({ turnInterval: 999, toolCallInterval: 999, cooldownMinutes: 0, mode: 'log-only' }, fire1.services)
+  const s = { id: 'session-remember', header: {}, deriveMessages: () => [] }
+  // 不传 signalCorrectionWords → 用 DEFAULTS（含记住/记忆）
+  t1.fire(s, { type: 'user/message', data: { content: [{ type: 'text', text: '帮我记住：web 跑在 19080' }], source: { kind: 'user' } } })
+  t1.fire(s, completedTurn)
+  await new Promise((r) => setTimeout(r, 60))
+  assert.equal(fire1.counter.reviews, 1, '记住 in default word list accelerates the review')
+  t1.fire(s, { type: 'user/message', data: { content: [{ type: 'text', text: '总结一下这段代码' }], source: { kind: 'user' } } })
+  t1.fire(s, completedTurn)
+  await new Promise((r) => setTimeout(r, 60))
+  assert.equal(fire1.counter.reviews, 1, '总结 stays out of the default list; cooldown would gate anyway')
+
+  const fire2 = countingServices()
+  const t2 = setupPlugin({ turnInterval: 999, toolCallInterval: 999, cooldownMinutes: 0, mode: 'log-only', signalCorrectionWords: '不对,错了' }, fire2.services)
+  t2.fire(s, { type: 'user/message', data: { content: [{ type: 'text', text: '记住这个' }], source: { kind: 'user' } } })
+  t2.fire(s, completedTurn)
+  await new Promise((r) => setTimeout(r, 60))
+  assert.equal(fire2.counter.reviews, 0, 'user-overridden word list replaces the defaults entirely')
+})
+
+test('v0.5 追加：status 的 memory.items 带只读条目原文', async () => {
+  const conclusion = JSON.stringify({ action: 'nothing', memory: { action: 'add', store: 'memory', text: 'fact for items' } })
+  const { home, oldHome, t } = await runE2E({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, conclusion)
+  try {
+    const route = t.routes[0]
+    const res = fakeRes()
+    await route.handler({ method: 'GET', url: '/hermes-loop/api/status' }, res)
+    const body = JSON.parse(res.body)
+    assert.deepEqual(body.memory.stores.memory.items, ['fact for items'])
+    assert.deepEqual(body.memory.stores.user.items, [])
+    assert.equal(body.memory.stores.memory.entries, 1) // entries 仍是计数
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})

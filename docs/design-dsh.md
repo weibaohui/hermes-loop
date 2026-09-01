@@ -235,7 +235,7 @@ hermes-loop:
   - **P2**：Curator 巡检应用转移前重查当前状态（手动 restore 优先）+ `archive ≥ stale+1` 运行时钳位；dispose 无条件冲洗；activity.jsonl 超 512KB 滚动截断（保留尾 2000 行）；windows 会话状态 7 天淘汰（随每小时定时器）；巡检定时器 1h 一醒（间隔交给 `curatorIntervalHours` 门控）；项目级技能不再进 suspects（writer 只认全局库，注入必然 patch-missing）；description 超长截断而非丢弃整条结论；settings 缺席时的回退 patch 走 `sanitizeSettingsPatch` 校验（非法 mode 不再静默落入 auto 直写）；
   - **客户端**：savePatch 检查 HTTP 状态（失败显示"保存失败"而非假"已保存"）；reviewNow 404/错误有可见反馈；usage 表头修正为"技能"；信号徽标 kind 本地化；usage.rows 缺失防御。
 - **v0.3（防碎片化）**：~~疑似相关 skill 全文注入~~（提前至 v0.1 完成）；**Curator 纯代码退休 pass ✅（设计见 §10）**——墙钟差值 + 惰性求值的三态状态机（active↔stale→archived；归档=翻 `disable-model-invocation`，永不删除；纳管事实依据统一为 activity.jsonl 的 write-outcome:created 账本，加载时回填存量）；**信号加速触发 ✅（设计见 §11）**——abort/工具失败突发/纠正词三类信号命中即跳过阈值提前复盘，冷却仍生效，词表面板可改、命中率面板度量。候选新增：**memory 通道 → 已立项为 v0.5，设计见 §12**（dsh 无原生 memory 机制；Hermes 原版 review 本就 memory+skill 合体，触发/守卫全复用；注入通道经 2026-09-01 平台实证改走 `systemPrompt.context()` 动态上下文，优于最初设想的 section 注入）。
-- **v0.5（memory 通道，2026-09-01 立项）**：复盘恢复 Hermes 的 memory+skill 合体——双结论协议（§12.3）、`~/.dsh/memory/{MEMORY,USER}.md` 双库、四条写入守卫（§12.4）、`systemPrompt.context()` 快照注入（§12.2）。设计见 §12。
+- **v0.5（memory 通道，2026-09-01 立项）**：复盘恢复 Hermes 的 memory+skill 合体——双结论协议（§12.3）、`~/.dsh/memory/{MEMORY,USER}.md` 双库、四条写入守卫（§12.4）、`systemPrompt.context()` 快照注入（§12.2）。设计见 §12。落地追加两项：纠正词默认表补入持久化意图词「记住,记忆」（命中即提前复盘，复盘读转写后通常写入记忆库；「总结」刻意不收——太常用会显著抬升复盘频率）；面板记忆卡带只读条目列表（§12.5，不做编辑 API 决议不变）。
 
 ## 10. Curator 设计（v0.3 补充，2026-08-29）
 
@@ -381,8 +381,8 @@ review prompt 增补（恢复 Hermes memory review 原题，research §5）：�
 
 ### 12.5 状态与面板
 
-- status 快照新增 `memory` 节：`{ stores: { memory: { chars, limit, entries, lastWriteAt }, user: { … } }, lastOutcome }`——数据来自注入函数的同一份进程内缓存，零额外 IO；
-- 面板新增"记忆"卡：两库用量条（chars/limit）、条目数、文件路径提示（手改即生效，下个模型步可见）。**不做编辑 API**——文件即界面，与"手改 SKILL.md"同哲学；
+- status 快照新增 `memory` 节：`{ stores: { memory: { chars, limit, entries, items, lastWriteAt }, user: { … } }, lastOutcome }`——`items` 是只读条目原文（≤40 条截断），`entries` 仍是计数；数据来自注入函数的同一份进程内缓存，零额外 IO；
+- 面板"记忆"卡：两库用量条（chars/limit）、条目数、最近写入、**只读条目列表**（"查看条目"折叠展开，解决"现在记了些什么"的面板内可见性）；**增删改仍走手改文件**——不做编辑 API 的决议不变，文件即界面，与"手改 SKILL.md"同哲学；
 - 不做 `/journey` 式时间线：单库 ≤2200 字符，肉眼可管。
 
 ### 12.6 明确不做与残余问题

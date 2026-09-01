@@ -56,6 +56,11 @@ const MEMORY_CONTROL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/
 // 凭据样式：条目里出现即拒绝（语义级判断仍交给 review prompt 的负面清单）
 const MEMORY_CREDENTIAL_RE = /(sk-[A-Za-z0-9_-]{16,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:password|passwd|api[_-]?key|apikey|secret|token)\b\s*[=:]\s*\S+)/i
 
+// 纠正词默认表（v0.5 起含持久化意图词「记住,记忆」：命中即提前复盘，复盘读转写后
+// 通常把用户要求记住的内容写入记忆库。「总结」刻意不收——太常用，会显著抬升复盘频率）。
+// DEFAULTS 与 settingsSchema 共用同一份，防止两处漂移。
+const DEFAULT_CORRECTION_WORDS = '不对,错了,重来,别这样,应该是,你弄错了,记住,记忆,wrong,try again,not what i,stop doing'
+
 /**
  * Audit/activity trail: append one JSON line per loop event to
  * `$DSH_HOME/hermes-loop/activity.jsonl`. Plugin `ctx.logger` output is
@@ -107,7 +112,7 @@ const DEFAULTS = {
   signalTriggerEnabled: true,
   signalToolFailureMin: 3,   // 窗口内 tool/result 失败 ≥N 次 → 加速（0=关）
   // 内置中英默认词表；用户可在面板/settings.yaml 整体改写（逗号分隔，全量替换）
-  signalCorrectionWords: '不对,错了,重来,别这样,应该是,你弄错了,wrong,try again,not what i,stop doing',
+  signalCorrectionWords: DEFAULT_CORRECTION_WORDS,
   // ── Memory 通道（design §12，v0.5）──
   memoryEnabled: true,        // MEMORY.md：环境/项目事实、约定、教训
   userProfileEnabled: true,   // USER.md：画像/偏好；两开关全关 → 协议退回 skill 单结论
@@ -136,7 +141,7 @@ function settingsSchema() {
     curatorIntervalHours: Schema.number().min(1).default(24),
     signalTriggerEnabled: Schema.boolean().default(true),
     signalToolFailureMin: Schema.number().min(0).default(3),
-    signalCorrectionWords: Schema.string().default('不对,错了,重来,别这样,应该是,你弄错了,wrong,try again,not what i,stop doing'),
+    signalCorrectionWords: Schema.string().default(DEFAULT_CORRECTION_WORDS),
     memoryEnabled: Schema.boolean().default(true),
     userProfileEnabled: Schema.boolean().default(true),
     memoryCharLimit: Schema.number().min(200).default(2200),
@@ -1581,6 +1586,9 @@ module.exports = {
           chars: memoryCharsOf(entries),
           limit: memoryStoreLimit(store, eff),
           entries: entries.length,
+          // 只读条目原文（面板"查看条目"用）；entries 仍是计数。库上限 ~2K 字符，
+          // 条目数天然有限，40 的截断只是防御手写超小条目刷屏
+          items: entries.slice(0, 40),
           lastWriteAt: lastMemoryOutcome && lastMemoryOutcome.store === store ? lastMemoryOutcome.at : undefined,
         }
       }
