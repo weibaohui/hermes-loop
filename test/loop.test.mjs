@@ -1012,3 +1012,321 @@ test('review fix: overlong description is truncated, not dropped (fail-closed st
   assert.equal(c.description.length, 500)
   assert.equal(parseConclusion(JSON.stringify({ action: 'create', skill: 'x', description: 'd', body: 'y'.repeat(129 * 1024) })), undefined, 'oversized body still fail-closed')
 })
+
+// ── Memory 通道（design §12，v0.5）──────────────────────────────────────
+
+const {
+  parseMemoryEntries, serializeMemoryEntries, planMemoryChange, scanMemoryEntry,
+  applyMemoryConclusion, renderMemoryContext, memoryStoreFile,
+} = plugin.__internals
+
+test('memory store: parse/serialize round-trips § entries, ignores noise, flattens newlines', () => {
+  const raw = '# MEMORY\n\n§ first entry\nsome handwritten note\n\n§ second entry\n'
+  assert.deepEqual(parseMemoryEntries(raw), ['first entry', 'second entry'])
+  assert.equal(serializeMemoryEntries('memory', ['a', 'b']), '# MEMORY\n\n§ a\n§ b\n')
+  assert.equal(serializeMemoryEntries('user', []), '# USER\n\n')
+  // 条目内换行折叠成空格：格式钉死一行一条
+  assert.equal(parseMemoryEntries(serializeMemoryEntries('memory', ['x\ny']))[0], 'x y')
+})
+
+test('memory scan rejects invisible unicode, control chars and credential patterns', () => {
+  assert.equal(scanMemoryEntry('normal entry about deploys'), null)
+  assert.equal(scanMemoryEntry('has\u200Bzero-width'), 'invisible-unicode')
+  assert.equal(scanMemoryEntry('bad\u0007bell'), 'control-char')
+  assert.equal(scanMemoryEntry('the key is sk-abcdefghijklmnop123456 ok'), 'credential-pattern')
+  assert.equal(scanMemoryEntry('password=hunter2'), 'credential-pattern')
+})
+
+test('planMemoryChange: add appends; duplicate / scan / over-limit rejections (§12.4 ①②③)', () => {
+  const base = ['existing entry']
+  const ok = planMemoryChange(base, { action: 'add', text: 'fresh fact' }, { limit: 2200 })
+  assert.equal(ok.ok, true)
+  assert.equal(ok.result, 'added')
+  assert.deepEqual(ok.entries, ['existing entry', 'fresh fact'])
+  // ① 去重——规范化空白后相同即拒绝
+  const dup = planMemoryChange(base, { action: 'add', text: 'existing   entry' }, { limit: 2200 })
+  assert.equal(dup.ok, false)
+  assert.equal(dup.reason, 'duplicate')
+  // ② 扫描
+  const scanned = planMemoryChange(base, { action: 'add', text: 'tok\u200Ben looks fine' }, { limit: 2200 })
+  assert.equal(scanned.ok, false)
+  assert.equal(scanned.reason, 'invisible-unicode')
+  // ③ 限额：超限拒绝（不连坐 skill 由 dispatch 通道隔离保证）
+  const over = planMemoryChange(base, { action: 'add', text: 'x'.repeat(50) }, { limit: 20 })
+  assert.equal(over.ok, false)
+  assert.equal(over.reason, 'over-limit')
+})
+
+test('planMemoryChange: replace/remove need oldText to hit exactly one entry (§12.4 ④)', () => {
+  const base = ['alpha one', 'beta two']
+  const rep = planMemoryChange(base, { action: 'replace', oldText: 'beta', text: 'beta three' }, { limit: 2200 })
+  assert.equal(rep.ok, true)
+  assert.equal(rep.result, 'replaced')
+  assert.deepEqual(rep.entries, ['alpha one', 'beta three'])
+  const amb = planMemoryChange(base, { action: 'remove', oldText: 'a' }, { limit: 2200 }) // 命中两条
+  assert.equal(amb.ok, false)
+  assert.equal(amb.reason, 'old-text-ambiguous')
+  const miss = planMemoryChange(base, { action: 'remove', oldText: 'gamma' }, { limit: 2200 })
+  assert.equal(miss.ok, false)
+  assert.equal(miss.reason, 'old-text-missing')
+  const rem = planMemoryChange(base, { action: 'remove', oldText: 'alpha one' }, { limit: 2200 })
+  assert.equal(rem.ok, true)
+  assert.deepEqual(rem.entries, ['beta two'])
+})
+
+test('parseConclusion: memory rides along; malformed memory drops without touching the skill conclusion', () => {
+  const both = parseConclusion('{"action":"create","skill":"a-b","description":"d","body":"b","memory":{"action":"add","store":"memory","text":"fact","rationale":"r"}}')
+  assert.equal(both.memory.action, 'add')
+  assert.equal(both.memory.store, 'memory')
+  // skill=nothing 但 memory 有效 → memory 保留（通道独立）
+  const memOnly = parseConclusion('{"action":"nothing","memory":{"action":"add","store":"user","text":"likes terse answers"}}')
+  assert.equal(memOnly.action, 'nothing')
+  assert.equal(memOnly.memory.text, 'likes terse answers')
+  // 畸形 memory（store 非法）只丢 memory
+  const badStore = parseConclusion('{"action":"create","skill":"a-b","description":"d","body":"b","memory":{"action":"add","store":"galaxy","text":"x"}}')
+  assert.equal(badStore.memory, undefined)
+  // remove 缺 oldText → 丢 memory
+  const noOld = parseConclusion('{"action":"nothing","memory":{"action":"remove","store":"memory"}}')
+  assert.equal(noOld.memory, undefined)
+  // 无 memory 字段 → undefined
+  assert.equal(parseConclusion('{"action":"nothing"}').memory, undefined)
+  // 超长 text 截断到 500（description 截断同款纪律）
+  const long = parseConclusion('{"action":"nothing","memory":{"action":"add","store":"memory","text":"' + 'x'.repeat(600) + '"}}')
+  assert.equal(long.memory.text.length, 500)
+})
+
+test('renderMemoryContext renders per-store usage; empty stores / all-disabled yield empty string', () => {
+  const eff = { memoryEnabled: true, userProfileEnabled: true, memoryCharLimit: 2200, userCharLimit: 1375 }
+  const readRaw = (store) => (store === 'memory' ? '# MEMORY\n\n§ fact one\n§ fact two\n' : '')
+  const out = renderMemoryContext(eff, readRaw)
+  assert.match(out, /长期记忆/)
+  assert.match(out, /MEMORY（环境\/项目事实\/约定\/教训） — 16\/2200 字符 · 2 条/)
+  assert.match(out, /§ fact one/)
+  assert.doesNotMatch(out, /USER（用户画像/) // 空库整节不出现
+  assert.equal(renderMemoryContext({ ...eff, memoryEnabled: false, userProfileEnabled: false }, readRaw), '')
+  assert.equal(renderMemoryContext(eff, () => ''), '')
+})
+
+test('applyMemoryConclusion: add/dup/replace/remove land in dir; store-disabled short-circuits', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'hermes-loop-mem-'))
+  try {
+    const limits = { memory: 2200, user: 1375 }
+    const enabled = { memory: true, user: false }
+    const add = await applyMemoryConclusion({ action: 'add', store: 'memory', text: 'publish needs otp' }, { dir, limits, enabled })
+    assert.equal(add.result, 'added')
+    assert.equal(add.entries, 1)
+    assert.match(await readFile(join(dir, 'MEMORY.md'), 'utf8'), /^# MEMORY\n\n§ publish needs otp\n$/)
+    const dup = await applyMemoryConclusion({ action: 'add', store: 'memory', text: 'publish needs otp' }, { dir, limits, enabled })
+    assert.equal(dup.result, 'rejected')
+    assert.equal(dup.reason, 'duplicate')
+    const rep = await applyMemoryConclusion({ action: 'replace', store: 'memory', oldText: 'publish needs otp', text: 'publish must use otp' }, { dir, limits, enabled })
+    assert.equal(rep.result, 'replaced')
+    assert.match(await readFile(join(dir, 'MEMORY.md'), 'utf8'), /publish must use otp/)
+    const dis = await applyMemoryConclusion({ action: 'add', store: 'user', text: 'x' }, { dir, limits, enabled })
+    assert.equal(dis.result, 'store-disabled')
+    const over = await applyMemoryConclusion({ action: 'add', store: 'memory', text: 'y'.repeat(3000) }, { dir, limits, enabled })
+    assert.equal(over.result, 'rejected')
+    assert.equal(over.reason, 'over-limit')
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
+
+test('memory context: session-frozen snapshots (Hermes semantics) — mid-session writes only visible to new sessions', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-memctx-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const contexts = []
+    const sections = []
+    const services = fakeServices('```json\n{"action":"nothing"}\n```')
+    services.systemPrompt = { section: (s) => sections.push(s), context: (c) => contexts.push(c) }
+    setupPlugin({ turnInterval: 999 }, services)
+    const memCtx = contexts.find((c) => c.name === 'hermes:memory')
+    assert.ok(memCtx, 'hermes:memory context registered')
+    assert.equal(typeof memCtx.text, 'function')
+    await mkdir(join(home, 'memory'), { recursive: true })
+    // 无 scope 的调用（非常规/旧路径）：现算不冻结
+    assert.equal(memCtx.text(), '')
+    // ── 会话首冻结（§12.2，Hermes 语义）：scope 即 agent 对象，一会话一快照 ──
+    await writeFile(join(home, 'memory', 'MEMORY.md'), '# MEMORY\n\n§ durable fact\n')
+    const scopeA = { tag: 'session-A' }
+    assert.match(memCtx.text({ scope: scopeA }), /§ durable fact/)
+    // 会话中途写入：scopeA 冻结在开局快照，看不到新条目
+    await writeFile(join(home, 'memory', 'MEMORY.md'), '# MEMORY\n\n§ durable fact\n§ second fact\n')
+    assert.doesNotMatch(memCtx.text({ scope: scopeA }), /second fact/, 'frozen snapshot ignores mid-session writes')
+    // 下个会话（新 scope）读到的才是新内容
+    assert.match(memCtx.text({ scope: { tag: 'session-B' } }), /§ second fact/)
+    // 空快照同样冻结：开局空库的会话不会因中途写入突然出现记忆
+    const scopeC = { tag: 'session-C' }
+    await rm(join(home, 'memory', 'MEMORY.md'))
+    assert.equal(memCtx.text({ scope: scopeC }), '')
+    await writeFile(join(home, 'memory', 'MEMORY.md'), '# MEMORY\n\n§ late fact\n')
+    assert.equal(memCtx.text({ scope: scopeC }), '', 'empty snapshot stays frozen for the whole session')
+    // 读盘故障（EISDIR）：该会话以空快照冻结，绝不抛
+    await rm(join(home, 'memory', 'MEMORY.md'))
+    await mkdir(join(home, 'memory', 'MEMORY.md'))
+    assert.equal(memCtx.text({ scope: { tag: 'session-D' } }), '')
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+async function runE2E(config, conclusionText) {
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-mem-e2e-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  const notices = []
+  const services = fakeServices('```json\n' + conclusionText + '\n```')
+  const t = setupPlugin(config, services)
+  const session = {
+    id: 'session-mem-e2e',
+    header: {},
+    deriveMessages: () => [{ role: 'user', content: 'do the thing' }],
+    append: (type, data) => notices.push(data),
+  }
+  t.fire(session, completedTurn)
+  await new Promise((r) => setTimeout(r, 90))
+  const followup = services.created.find((c) => c && c.content)
+  return { home, oldHome, notices, t, followup }
+}
+
+test('memory e2e: skill=nothing with memory add writes USER.md, echoes a notice, injects entries into the review prompt', async () => {
+  const conclusion = JSON.stringify({ action: 'nothing', rationale: 'no skill this time', memory: { action: 'add', store: 'user', text: 'user prefers terse answers', rationale: 'said 直接给答案' } })
+  const { home, oldHome, notices, followup } = await runE2E({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, conclusion)
+  try {
+    assert.match(await readFile(join(home, 'memory', 'USER.md'), 'utf8'), /§ user prefers terse answers/)
+    assert.ok(notices.some((n) => n.source && n.source.form === 'notice' && n.source.summary.includes('记忆')), notices.map((n) => n.source && n.source.summary).join('|'))
+    assert.ok(notices.some((n) => n.source.summary.includes('下个会话生效')), 'echo must state next-session semantics')
+    // 当前记忆条目注入 review prompt（oldText 定位与去重的基准）+ 记忆规则段（按需产出）
+    assert.ok(JSON.stringify(followup).includes('当前记忆条目'))
+    assert.ok(JSON.stringify(followup).includes('多数复盘应该没有记忆'))
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('memory e2e: combined conclusion writes skill AND memory; guards only reject their own channel', async () => {
+  const conclusion = JSON.stringify({
+    action: 'create', skill: 'mem-e2e-skill', description: 'has both channels', body: 'body here',
+    memory: { action: 'add', store: 'memory', text: 'deploy needs otp' },
+  })
+  const { home, oldHome } = await runE2E({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, conclusion)
+  try {
+    assert.match(await readFile(join(home, 'skills', 'mem-e2e-skill', 'SKILL.md'), 'utf8'), /body here/)
+    assert.match(await readFile(join(home, 'memory', 'MEMORY.md'), 'utf8'), /§ deploy needs otp/)
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('memory e2e: log-only logs the memory conclusion without touching disk; approval stages a pending JSON', async () => {
+  const mkConclusion = () => JSON.stringify({ action: 'nothing', memory: { action: 'add', store: 'memory', text: 'web runs on 19080' } })
+  // log-only
+  {
+    const { home, oldHome, t } = await runE2E({ turnInterval: 1, cooldownMinutes: 0, mode: 'log-only' }, mkConclusion())
+    try {
+      assert.ok(t.infos.some((m) => m.includes('log-only') && m.includes('memory')), t.infos.join('|'))
+      let absent = false
+      try { await readFile(join(home, 'memory', 'MEMORY.md'), 'utf8') } catch { absent = true }
+      assert.ok(absent, 'log-only must not write memory files')
+    } finally {
+      if (oldHome === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = oldHome
+      await rm(home, { recursive: true, force: true })
+    }
+  }
+  // approval：纯记忆结论也有稳定 pending 标识与 memoryDir 提示
+  {
+    const { home, oldHome } = await runE2E({ turnInterval: 1, cooldownMinutes: 0, mode: 'approval' }, mkConclusion())
+    try {
+      const { readdir } = await import('node:fs/promises')
+      const staged = await readdir(join(home, 'hermes-loop', 'pending'))
+      assert.equal(staged.length, 1)
+      assert.match(staged[0], /-memory-memory\.json$/)  // `${ts36}-memory-${store}` 后缀
+      const payload = JSON.parse(await readFile(join(home, 'hermes-loop', 'pending', staged[0]), 'utf8'))
+      assert.equal(payload.memoryDir, join(home, 'memory'))
+      assert.equal(payload.conclusion.memory.text, 'web runs on 19080')
+    } finally {
+      if (oldHome === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = oldHome
+      await rm(home, { recursive: true, force: true })
+    }
+  }
+})
+
+test('GET status exposes memory stores (enabled/chars/limit/entries) and the last memory outcome', async () => {
+  const conclusion = JSON.stringify({ action: 'nothing', memory: { action: 'add', store: 'memory', text: 'fact for status' } })
+  const { home, oldHome, t } = await runE2E({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, conclusion)
+  try {
+    const route = t.routes[0]
+    const res = fakeRes()
+    await route.handler({ method: 'GET', url: '/hermes-loop/api/status' }, res)
+    const body = JSON.parse(res.body)
+    assert.equal(res.statusCode, 200)
+    assert.ok(body.memory && body.memory.stores)
+    const mem = body.memory.stores.memory
+    assert.equal(mem.enabled, true)
+    assert.equal(mem.chars, 'fact for status'.length)
+    assert.equal(mem.limit, 2200)
+    assert.equal(mem.entries, 1)
+    assert.ok(mem.lastWriteAt, 'lastWriteAt fed from the memory-outcome audit record')
+    assert.equal(body.memory.stores.user.entries, 0)
+    assert.equal(body.memory.lastOutcome.result, 'added')
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('v0.5 追加：默认纠正词表含「记住,记忆」持久化意图词，不含「总结」', () => {
+  const words = plugin.__internals.parseCorrectionWords(DEFAULTS.signalCorrectionWords)
+  assert.ok(words.includes('记住') && words.includes('记忆'))
+  assert.ok(!words.includes('总结'), '总结 too common — deliberately excluded')
+  assert.ok(!words.includes('wrong ') && words.includes('wrong'))
+})
+
+test('v0.5 追加：默认词表下「记住：X」命中信号提前复盘，「总结一下」不触发', async () => {
+  const fire1 = countingServices()
+  const t1 = setupPlugin({ turnInterval: 999, toolCallInterval: 999, cooldownMinutes: 0, mode: 'log-only' }, fire1.services)
+  const s = { id: 'session-remember', header: {}, deriveMessages: () => [] }
+  // 不传 signalCorrectionWords → 用 DEFAULTS（含记住/记忆）
+  t1.fire(s, { type: 'user/message', data: { content: [{ type: 'text', text: '帮我记住：web 跑在 19080' }], source: { kind: 'user' } } })
+  t1.fire(s, completedTurn)
+  await new Promise((r) => setTimeout(r, 60))
+  assert.equal(fire1.counter.reviews, 1, '记住 in default word list accelerates the review')
+  t1.fire(s, { type: 'user/message', data: { content: [{ type: 'text', text: '总结一下这段代码' }], source: { kind: 'user' } } })
+  t1.fire(s, completedTurn)
+  await new Promise((r) => setTimeout(r, 60))
+  assert.equal(fire1.counter.reviews, 1, '总结 stays out of the default list; cooldown would gate anyway')
+
+  const fire2 = countingServices()
+  const t2 = setupPlugin({ turnInterval: 999, toolCallInterval: 999, cooldownMinutes: 0, mode: 'log-only', signalCorrectionWords: '不对,错了' }, fire2.services)
+  t2.fire(s, { type: 'user/message', data: { content: [{ type: 'text', text: '记住这个' }], source: { kind: 'user' } } })
+  t2.fire(s, completedTurn)
+  await new Promise((r) => setTimeout(r, 60))
+  assert.equal(fire2.counter.reviews, 0, 'user-overridden word list replaces the defaults entirely')
+})
+
+test('v0.5 追加：status 的 memory.items 带只读条目原文', async () => {
+  const conclusion = JSON.stringify({ action: 'nothing', memory: { action: 'add', store: 'memory', text: 'fact for items' } })
+  const { home, oldHome, t } = await runE2E({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, conclusion)
+  try {
+    const route = t.routes[0]
+    const res = fakeRes()
+    await route.handler({ method: 'GET', url: '/hermes-loop/api/status' }, res)
+    const body = JSON.parse(res.body)
+    assert.deepEqual(body.memory.stores.memory.items, ['fact for items'])
+    assert.deepEqual(body.memory.stores.user.items, [])
+    assert.equal(body.memory.stores.memory.entries, 1) // entries 仍是计数
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
