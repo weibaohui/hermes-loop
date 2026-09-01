@@ -809,36 +809,46 @@ module.exports = {
       }
     }
 
-    // ── Memory 注入通道（design §12.2，v0.5）──
-    // 用 context()（动态运行时上下文）而非 section()：assemble 在每个模型步执行、
-    // text 可为函数逐步求值；RuntimeContextProjection 做 delta 投影——文本没变不追加
-    // 任何消息（prefix cache 无损），变了才追加一条快照 user/message 当步可见。
-    // text 函数在模型步关键路径上，绝不允许抛错：读库失败回退进程内上次成功快照。
+    // ── Memory 注入通道（design §12.2，v0.5；会话首冻结，2026-09-01 用户拍板）──
+    // 通道仍选 context()（动态运行时上下文）而非 section()，缓存理由变得更硬：
+    // section 的 text 在 system prompt 里——那是请求前缀，任何变更都打爆整个会话的
+    // prefix cache；context 快照是追加式消息，位置一旦落定不再移动，追加不伤已缓存前缀。
+    // 语义对齐 Hermes：**会话首冻结**——scope 即 agent 对象，第一次 assemble 读盘渲染后
+    // 冻结进 WeakMap（随 agent 回收自动清理），会话内恒定、恰一条会话首快照消息；
+    // 复盘写入/手改文件对当前会话不可见，下个会话生效。
     if (ctx.systemPrompt && typeof ctx.systemPrompt.context === 'function') {
-      const memoryCache = { text: '', lastWarnAt: 0 }
+      const memoryFreeze = new WeakMap() // scope(agent) → 会话首快照文本（可为 ''）
+      const memoryWarn = { at: 0 }
+      const renderMemorySafe = () => {
+        try {
+          return renderMemoryContext(effective(), (store) => {
+            try { return fs.readFileSync(memoryStoreFile(store), 'utf8') } catch { return '' }
+          })
+        } catch (e) {
+          // 读盘/渲染故障：本会话以空快照起步（宁可空不可错），限频告警防刷日志
+          const nowMs = Date.now()
+          if (nowMs - memoryWarn.at > 60_000) {
+            memoryWarn.at = nowMs
+            ctx.logger.warn(`hermes-loop: memory context render failed, serving empty snapshot: ${e && e.message}`)
+          }
+          return ''
+        }
+      }
       ctx.effect(() => ctx.systemPrompt.context({
         name: 'hermes:memory', // 同层同名抛错——本插件唯一的 context 名
         order: 40,
-        text: () => {
-          try {
-            const eff = effective()
-            const next = renderMemoryContext(eff, (store) => {
-              try { return fs.readFileSync(memoryStoreFile(store), 'utf8') } catch { return '' }
-            })
-            memoryCache.text = next
-            return next
-          } catch (e) {
-            // 读盘/渲染故障：退回上次成功快照（可能为空串），限频告警防刷日志
-            const nowMs = Date.now()
-            if (nowMs - memoryCache.lastWarnAt > 60_000) {
-              memoryCache.lastWarnAt = nowMs
-              ctx.logger.warn(`hermes-loop: memory context render failed, serving last snapshot: ${e && e.message}`)
-            }
-            return memoryCache.text
+        text: (asmCtx) => {
+          const scope = asmCtx && typeof asmCtx === 'object' ? asmCtx.scope : undefined
+          if (scope && typeof scope === 'object') {
+            if (memoryFreeze.has(scope)) return memoryFreeze.get(scope)
+            const text = renderMemorySafe()
+            memoryFreeze.set(scope, text)
+            return text
           }
+          return renderMemorySafe() // 无 scope（非常规调用/测试）：现算，不冻结
         },
       }), 'hermes-loop: memory context')
-      ctx.logger.info && ctx.logger.info('hermes-loop: memory context registered (~/.dsh/memory/{MEMORY,USER}.md)')
+      ctx.logger.info && ctx.logger.info('hermes-loop: memory context registered (~/.dsh/memory/{MEMORY,USER}.md, frozen per session)')
     }
 
     // ── Trigger state ──
@@ -1297,7 +1307,8 @@ module.exports = {
         const verb = { added: '写入', replaced: '改写', removed: '移除' }[outcome.result]
         if (verb !== undefined) {
           ctx.logger.info(`${memHead} — ${outcome.result} (${outcome.chars}/${outcome.limit} chars, ${outcome.entries} entries)`)
-          notifySourceSession(session, `后台复盘已${verb}记忆（${mem.store.toUpperCase()}，${outcome.chars}/${outcome.limit} 字符）${mem.rationale ? `：${mem.rationale}` : ''}`)
+          // 注入是会话首冻结（§12.2）：明示"下个会话生效"，不让用户以为当前会话立即可见
+          notifySourceSession(session, `后台复盘已${verb}记忆（${mem.store.toUpperCase()}，${outcome.chars}/${outcome.limit} 字符，下个会话生效）${mem.rationale ? `：${mem.rationale}` : ''}`)
         } else if (outcome.result === 'rejected') {
           ctx.logger.warn(`${memHead} — rejected: ${outcome.reason}. ${outcome.detail || ''}`)
         } else {

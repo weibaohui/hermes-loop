@@ -74,7 +74,7 @@ skill writer                                   memory writer（§12，同队列�
       │  mode=log-only → 仅 ctx.logger.info 输出结论，不落盘
       ▼
 可见性：skill 走 chokidar watcher 自动 invalidate（~200ms）→ 下一会话 pre-step 可见；
-        memory 走 systemPrompt.context() 快照投影——变更随下一个模型步注入当前会话（§12.2）
+        memory 走 systemPrompt.context() 会话首冻结快照——写入/手改下个会话生效（§12.2）
 ```
 
 **与 Hermes 的关键差异（有意为之）**：
@@ -343,22 +343,19 @@ review-start 审计事件带 `signal` 字段；status 快照的 `signals` 节聚
 
 "流程 → skill"的分界不变，memory 只接事实与画像。目录尊重 `DSH_HOME`（复用 dshHome()，与 skills/pending 同一套根解析）；条目以 `§ ` 前缀行分隔（Hermes 同款，人可直接读改）。
 
-### 12.2 注入通道：systemPrompt.context()（本设计的核心决定）
+### 12.2 注入通道：systemPrompt.context() + 会话首冻结（本设计的核心决定）
 
-**不用 section()，用 context()（动态运行时上下文）**。实证链：
+**通道选 context()（动态运行时上下文）而非 section()，缓存理由是硬的**：section 的 text 渲染进 system prompt——那是每个请求的前缀，任何变更都会打爆整个会话的 prefix cache，所以 system prompt 必须恒定；context 快照则是**追加式消息**（RuntimeContextProjection 以 `user/message`、source.kind=plugin 并入当步消息，agent-loop lib index.js:63-80），位置一旦落定不再移动，追加不伤已缓存前缀。实证：assemble 在每个模型步 preStep 执行（dsh-agent-loop/lib/index.js:492-505），section/context 的 text 均可为函数逐步求值（dsh-system-prompt/lib/index.js:271、278）。
 
-1. `assemble()` 在**每个模型步的 preStep 里执行**（dsh-agent-loop/lib/index.js:492-505 → dsh-system-prompt/lib/index.js:240）；section 与 context 的 `text` 都**可以是函数，逐步重新求值**（dsh-system-prompt/lib/index.js:271、278）；
-2. context 渲染为运行时上下文快照，头部固定 "Current runtime context. This snapshot supersedes earlier runtime-context snapshots."（:87），经 RuntimeContextProjection.project() 以 `user/message`（source.kind=plugin、form=snapshot）并入当步消息（dsh-agent-loop/lib/index.js:63-80）——**文本与上次保留值相同就不追加任何消息**（delta 投影；由无到有、由有到无各有一条边界消息）。
+**冻结语义（2026-09-01 用户拍板，对齐 Hermes「下次会话生效」）**：快照文本在**会话第一次 assemble 时**读盘渲染并冻结——assembly 的 `scope` 即 agent 对象（dsh-agent/lib/index.js:384-390 `assembleContextFor` 返回 `{ agent, scope: agent }`），`WeakMap<scope, text>` 以会话为粒度缓存，随 agent 回收自动清理，无手动生命周期。由此：
 
-由此得到比 Hermes 冻结快照更优的性质：
+- **会话内恒定**：模型看到的记忆开局即定格，行为可预期；delta 投影退化为**一会话恰一条**会话首快照消息，之后再无追加；
+- **缓存最优**：system prompt 恒定 + 会话首恰一条快照消息，第一步起前缀即稳定，全程最优命中。对比 delta 方案（变更时中途追加一条快照，同样不破前缀缓存，但引入会话内视图变化与一次追加成本），冻结在缓存与可预期性上更严格，代价是变更可见性降级——**复盘写入/手改文件对当前会话不可见，下个会话生效**（回显文案明示）；
+- 与 Hermes 的差异只剩通道位置：Hermes 把冻结块拼进 system prompt（所以只能下会话生效，否则打爆缓存）；我们把冻结块放在追加式 context 消息里，即使未来想改回实时语义也只是换 text 函数的求值策略，不动通道。
 
-- **静止期零成本**：函数每次返回同一文本 → project() 判等 → 不追加消息；system prompt 恒定 → prefix cache 表现与 v0.1 完全一致；
-- **变更当场可见**：复盘写入记忆 → 下一步 assemble 读到新文本 → 追加一条快照消息，**模型当步可见，无需等下个会话**（Hermes 只能下会话生效；快照头自带"以最新快照为准"的指令）；
-- **文件即界面**：每步重读文件，用户手改 MEMORY.md 自动可见，无需 watcher、无需 API。
+注册：`ctx.systemPrompt.context({ name: 'hermes:memory', order: 40, text })`。同层同名抛错（dsh-system-prompt/lib/index.js:142-143）——与 §5 的 loop-aware section（order 51、section 通道）不同名不同通道，无冲突。渲染格式：分库小节，库头部含 字符数/上限与条目数（面板用量同源），条目 `§ ` 分隔；**两库全空返回 `''`**（renderContextSections 过滤空文本，快照整体不出现，与会话启动前无记忆的干净状态一致）。
 
-注册：`ctx.systemPrompt.context({ name: 'hermes:memory', order: 40, text: () => renderMemoryContext() })`。同层同名抛错（dsh-system-prompt/lib/index.js:142-143）——与 §5 的 loop-aware section（order 51、section 通道）不同名不同通道，无冲突。渲染格式：分库小节，库头部含 字符数/上限与条目数（面板用量同源），条目 `§ ` 分隔；**两库全空返回 `''`**（renderContextSections 过滤空文本，快照整体不出现，与会话启动前无记忆的干净状态一致）。
-
-**text 函数绝不允许抛错**——assemble 在每个模型步的关键路径上。读文件失败（权限/IO）返回进程内上次成功快照或空串 + `logger.warn` 降级，绝不让一次文件故障打死所有会话。文件 ≤2KB，每步 readFileSync 成本可忽略；写入走原子 rename，读者只见旧或新、绝不见半截。快照消息 source.kind=plugin，天然不会被 §3 的触发计数和 §11 的纠正词误捕（kind=user 才计）。
+**text 函数绝不允许抛错**——assemble 在每个模型步的关键路径上。读盘/渲染故障时该次快照以空串冻结（宁可空不可错）+ 限频（60s）warn，绝不让一次文件故障打死会话。文件 ≤2KB，会话首读一次，成本可忽略；写入走原子 rename，读者只见旧或新、绝不见半截。快照消息 source.kind=plugin，天然不会被 §3 的触发计数和 §11 的纠正词误捕（kind=user 才计）。
 
 ### 12.3 双结论协议（向后兼容）
 
@@ -389,6 +386,7 @@ review prompt 增补（恢复 Hermes memory review 原题，research §5）：�
 
 - **无 read 工具、无检索**：记忆全量注入（上限 2200+1375 字符），装不下的历史交给 FTS 会话回查（仍在 v1 不做清单，另行立项）；
 - **外部记忆 provider（Mem0/Honcho 等 8 家）**：dsh 无 provider 插槽，等真实需求；
-- **长会话快照堆积**：每次变更追加一条快照消息，多次写入留多条历史快照——单条 ≤4KB，且会话有 compaction 兜底，接受；
+- **长会话快照堆积**：~~每次变更追加一条快照消息~~ 已随会话首冻结语义消失——一会话恰一条开局快照，此后零追加；
 - **runtimeContextSuppressed**：任何插件注册 suppressor 会整体关闭动态上下文（含本通道与时间上下文）——宿主级行为，不在插件侧防御；
+- **会话内写入不可见**：冻结语义的固有代价（对齐 Hermes）——当前会话模型看到的记忆开局定格；紧急修正可让模型直接用文件工具读 `~/.dsh/memory/`，或重启会话；
 - **单结论单 op**：v0.5 简化；出现真实碎片化后升数组或仿 §10 加纯代码 Curator pass。

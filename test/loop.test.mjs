@@ -1130,7 +1130,7 @@ test('applyMemoryConclusion: add/dup/replace/remove land in dir; store-disabled 
   } finally { await rm(dir, { recursive: true, force: true }) }
 })
 
-test('memory context registers via systemPrompt.context; text() renders from disk and never throws', async () => {
+test('memory context: session-frozen snapshots (Hermes semantics) — mid-session writes only visible to new sessions', async () => {
   const home = await mkdtemp(join(tmpdir(), 'hermes-loop-memctx-'))
   const oldHome = process.env.DSH_HOME
   process.env.DSH_HOME = home
@@ -1143,15 +1143,28 @@ test('memory context registers via systemPrompt.context; text() renders from dis
     const memCtx = contexts.find((c) => c.name === 'hermes:memory')
     assert.ok(memCtx, 'hermes:memory context registered')
     assert.equal(typeof memCtx.text, 'function')
-    // 空库 → ''（快照整体不出现）
     await mkdir(join(home, 'memory'), { recursive: true })
+    // 无 scope 的调用（非常规/旧路径）：现算不冻结
     assert.equal(memCtx.text(), '')
+    // ── 会话首冻结（§12.2，Hermes 语义）：scope 即 agent 对象，一会话一快照 ──
     await writeFile(join(home, 'memory', 'MEMORY.md'), '# MEMORY\n\n§ durable fact\n')
-    assert.match(memCtx.text(), /§ durable fact/)
-    // 读盘故障（EISDIR）被吞掉：渲染降级为空，绝不抛
+    const scopeA = { tag: 'session-A' }
+    assert.match(memCtx.text({ scope: scopeA }), /§ durable fact/)
+    // 会话中途写入：scopeA 冻结在开局快照，看不到新条目
+    await writeFile(join(home, 'memory', 'MEMORY.md'), '# MEMORY\n\n§ durable fact\n§ second fact\n')
+    assert.doesNotMatch(memCtx.text({ scope: scopeA }), /second fact/, 'frozen snapshot ignores mid-session writes')
+    // 下个会话（新 scope）读到的才是新内容
+    assert.match(memCtx.text({ scope: { tag: 'session-B' } }), /§ second fact/)
+    // 空快照同样冻结：开局空库的会话不会因中途写入突然出现记忆
+    const scopeC = { tag: 'session-C' }
+    await rm(join(home, 'memory', 'MEMORY.md'))
+    assert.equal(memCtx.text({ scope: scopeC }), '')
+    await writeFile(join(home, 'memory', 'MEMORY.md'), '# MEMORY\n\n§ late fact\n')
+    assert.equal(memCtx.text({ scope: scopeC }), '', 'empty snapshot stays frozen for the whole session')
+    // 读盘故障（EISDIR）：该会话以空快照冻结，绝不抛
     await rm(join(home, 'memory', 'MEMORY.md'))
     await mkdir(join(home, 'memory', 'MEMORY.md'))
-    assert.equal(memCtx.text(), '')
+    assert.equal(memCtx.text({ scope: { tag: 'session-D' } }), '')
   } finally {
     if (oldHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = oldHome
@@ -1184,6 +1197,7 @@ test('memory e2e: skill=nothing with memory add writes USER.md, echoes a notice,
   try {
     assert.match(await readFile(join(home, 'memory', 'USER.md'), 'utf8'), /§ user prefers terse answers/)
     assert.ok(notices.some((n) => n.source && n.source.form === 'notice' && n.source.summary.includes('记忆')), notices.map((n) => n.source && n.source.summary).join('|'))
+    assert.ok(notices.some((n) => n.source.summary.includes('下个会话生效')), 'echo must state next-session semantics')
     // 当前记忆条目注入 review prompt（oldText 定位与去重的基准）+ 记忆规则段（按需产出）
     assert.ok(JSON.stringify(followup).includes('当前记忆条目'))
     assert.ok(JSON.stringify(followup).includes('多数复盘应该没有记忆'))
