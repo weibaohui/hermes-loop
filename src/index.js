@@ -979,6 +979,8 @@ module.exports = {
       const byTo = (to) => applied.filter((t) => t.to === to).length
       curatorMeta.lastSummary = `checked ${curatorSkills.size}: +${byTo('stale')} stale, +${byTo('archived')} archived, ${byTo('active')} back to active`
       try { await flushUsage() } catch {}
+      // 归档会翻 frontmatter 治理键——后台刷一次 modelInvocable 缓存，让面板状态列尽快对上
+      if (applied.some((t) => t.to === 'archived')) refreshInvocable()
       trace('curator-run', { manual, summary: curatorMeta.lastSummary, applied })
       ctx.logger.info && ctx.logger.info(`hermes-loop: curator pass — ${curatorMeta.lastSummary}`)
       return { at: curatorMeta.lastRunAt, checked: curatorSkills.size, transitions: applied, counts, summary: curatorMeta.lastSummary }
@@ -998,6 +1000,7 @@ module.exports = {
       rec.state = 'active'
       rec.lastRestoredAt = new Date().toISOString()
       try { await flushUsage() } catch {}
+      refreshInvocable() // 恢复会移除治理键——后台刷 modelInvocable 缓存，状态列尽快对上
       trace('curator-restore', { skill: name, note })
       return { ok: true, note }
     }
@@ -1438,6 +1441,28 @@ module.exports = {
     }, 'hermes-loop: session/event subscription')
 
     // ── Client API（web 面板的唯一数据源；宿主面动态注入 webServer 是可用路径）──
+    // modelInvocable 快照缓存（stale-while-revalidate）：ctx.skills.snapshot() 在宿主
+    // 技能目录缓存失效后（任何技能文件变动都会触发）做全量重扫，本机实测 ~3.7s。/status
+    // 若 await 它，每次打开面板 tab、以及轮询撞上冷缓存时都会卡数秒（界面只剩「…」）。
+    // 策略：请求路径永远只读插件内缓存；过期才后台单飞刷新，刷新完成前回上次已知值
+    // （首启首刷完成前状态列为「—」，面板图例已覆盖该语义）。
+    let invocableCache = null // { at: ms, map: Map<name, boolean> } | null
+    let invocableInflight = null
+    const INVOCABLE_TTL_MS = 60_000
+    const refreshInvocable = () => {
+      if (invocableInflight !== null) return invocableInflight
+      invocableInflight = (async () => {
+        try {
+          const snapshot = await ctx.skills.snapshot({})
+          invocableCache = {
+            at: Date.now(),
+            map: new Map((snapshot.skills || []).map((s) => [s.name, !(s.invocation && s.invocation.modelInvocable === false)])),
+          }
+        } catch { /* 刷新失败：保留旧缓存，下轮再试 */ }
+        finally { invocableInflight = null }
+      })()
+      return invocableInflight
+    }
     const sendJson = (res, status, payload) => {
       res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
       res.end(JSON.stringify(payload))
@@ -1525,12 +1550,10 @@ module.exports = {
         }
       }
       const current = sessionId !== undefined && sessionId !== '' ? sessions[sessionId] : undefined
-      // 目录快照提供每个技能当前的 modelInvocable（frontmatter 治理键的实时状态）
-      let invocableByName = null
-      try {
-        const snapshot = await ctx.skills.snapshot({})
-        invocableByName = new Map((snapshot.skills || []).map((s) => [s.name, !(s.invocation && s.invocation.modelInvocable === false)]))
-      } catch { /* snapshot 失败：状态列留空 */ }
+      // 目录快照提供每个技能当前的 modelInvocable（frontmatter 治理键的实时状态）。
+      // 绝不在此 await 冷重扫（见 refreshInvocable 注释）：立即回上次已知值，过期才后台刷新
+      if (invocableCache === null || Date.now() - invocableCache.at > INVOCABLE_TTL_MS) refreshInvocable()
+      const invocableByName = invocableCache !== null ? invocableCache.map : null
       const usageRows = [...usage.entries()]
         .map(([skill, u]) => ({ skill, count: u.count, lastUsedAt: u.lastUsedAt, lastSessionId: u.lastSessionId }))
         .sort((a, b) => b.count - a.count)

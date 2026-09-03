@@ -17,6 +17,7 @@ window.__ModuleLoader__.load({
     var DICT = {
       zh: {
         tab: 'Hermes Loop',
+        loading: '加载中…',
         disabled: '学习循环未启用',
         enabled: '运行中',
         mode: '模式',
@@ -98,6 +99,7 @@ window.__ModuleLoader__.load({
       },
       en: {
         tab: 'Hermes Loop',
+        loading: 'Loading…',
         disabled: 'Learning loop disabled',
         enabled: 'Active',
         mode: 'Mode',
@@ -188,6 +190,7 @@ window.__ModuleLoader__.load({
       '.hl-dot.off{background:var(--dsw-alias-state-negative,#c75050)}',
       '.hl-dot.busy{background:var(--dsw-alias-state-warning,#d99a2b);animation:hl-pulse 1.2s infinite}',
       '@keyframes hl-pulse{50%{opacity:.35}}',
+      '.hl-loading{animation:hl-pulse 1.2s infinite}',
       '.hl-card{background:var(--dsw-alias-bg-layer-2,rgba(128,128,128,.08));border:1px solid var(--dsw-alias-border-l2,rgba(128,128,128,.25));border-radius:10px;padding:12px 14px}',
       '.hl-card h3{margin:0 0 8px;font-size:12px;font-weight:600;opacity:.7;text-transform:uppercase;letter-spacing:.04em}',
       '.hl-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:4px 0}',
@@ -328,7 +331,7 @@ window.__ModuleLoader__.load({
         if (error !== null && data === null) {
           return h('div', { className: 'hl-wrap' }, h('div', { className: 'hl-err' }, error))
         }
-        if (data === null) return h('div', { className: 'hl-wrap hl-mut' }, '…')
+        if (data === null) return h('div', { className: 'hl-wrap hl-mut hl-loading' }, t('loading'))
 
         var eff = data.settings || {}
         var cur = data.current || {}

@@ -337,6 +337,48 @@ test('GET /hermes-loop/api/status exposes settings, per-session counters and wri
   }
 })
 
+test('GET /status never blocks on a slow skills.snapshot (panel opens instantly)', async () => {
+  // 回归：宿主的技能目录冷重扫要数秒（缓存失效后全量重读）。/status 若 await 它，
+  // 打开面板 tab 就卡数秒。策略改为 stale-while-revalidate：请求路径只读插件内缓存，
+  // 过期才后台单飞刷新（见 src/index.js refreshInvocable 注释）。
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-slow-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const services = fakeServices('```json\n{"action":"nothing"}\n```')
+    let fulfilSnapshot
+    services.skills = { snapshot: () => new Promise((r) => { fulfilSnapshot = r }) }
+    const t = setupPlugin({}, services)
+    await new Promise((r) => setTimeout(r, 30))
+    const route = t.routes[0]
+    // 种一条 usage 行，让 modelInvocable 列可观察
+    const session = { id: 'session-slow', header: {}, deriveMessages: () => [] }
+    t.fire(session, { type: 'tool/call', data: { name: 'skill', arguments: JSON.stringify({ name: 'slow-skill' }) } })
+
+    // 首次请求：快照永不到达也不得阻塞（本机冷重扫实测 ~3.7s，这里用永不 settle 的 promise 顶格验证）
+    const started = Date.now()
+    const res = fakeRes()
+    await route.handler({ method: 'GET', url: '/hermes-loop/api/status?sessionId=session-slow' }, res)
+    const elapsed = Date.now() - started
+    assert.equal(res.statusCode, 200)
+    assert.ok(elapsed < 500, `status must not await skills.snapshot (took ${elapsed}ms)`)
+    const row = JSON.parse(res.body).usage.rows.find((r) => r.skill === 'slow-skill')
+    assert.equal(row.modelInvocable, undefined, 'snapshot still pending → column stays undefined (UI shows —)')
+
+    // 后台刷新落地 → 下一次请求不阻塞地拿到新值
+    fulfilSnapshot({ skills: [{ name: 'slow-skill', invocation: { modelInvocable: false } }] })
+    await new Promise((r) => setTimeout(r, 30))
+    const res2 = fakeRes()
+    await route.handler({ method: 'GET', url: '/hermes-loop/api/status?sessionId=session-slow' }, res2)
+    const row2 = JSON.parse(res2.body).usage.rows.find((r) => r.skill === 'slow-skill')
+    assert.equal(row2.modelInvocable, false)
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
 test('POST /hermes-loop/api/settings patches mode via settings scope', async () => {
   const updates = []
   const scope = { get: () => ({ mode: 'approval' }), update: async (patch) => { updates.push(patch) } }
