@@ -1463,6 +1463,9 @@ module.exports = {
       })()
       return invocableInflight
     }
+    const kickInvocableIfStale = () => {
+      if (invocableCache === null || Date.now() - invocableCache.at > INVOCABLE_TTL_MS) refreshInvocable()
+    }
     const sendJson = (res, status, payload) => {
       res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
       res.end(JSON.stringify(payload))
@@ -1551,8 +1554,9 @@ module.exports = {
       }
       const current = sessionId !== undefined && sessionId !== '' ? sessions[sessionId] : undefined
       // 目录快照提供每个技能当前的 modelInvocable（frontmatter 治理键的实时状态）。
-      // 绝不在此 await 冷重扫（见 refreshInvocable 注释）：立即回上次已知值，过期才后台刷新
-      if (invocableCache === null || Date.now() - invocableCache.at > INVOCABLE_TTL_MS) refreshInvocable()
+      // 绝不在此 await 冷重扫（见 refreshInvocable 注释）：立即回上次已知值。
+      // 刷新启动也不在这里——冷重扫含同步 IO 段，先启动会把本响应的 flush 堵在事件循环里；
+      // 由路由在 sendJson 之后调 kickInvocableIfStale()
       const invocableByName = invocableCache !== null ? invocableCache.map : null
       const usageRows = [...usage.entries()]
         .map(([skill, u]) => ({ skill, count: u.count, lastUsedAt: u.lastUsedAt, lastSessionId: u.lastSessionId }))
@@ -1656,6 +1660,8 @@ module.exports = {
               const apiPath = url.pathname.replace(/\/+$/, '')
               if (req.method === 'GET' && apiPath.endsWith('/hermes-loop/api/status')) {
                 sendJson(res, 200, await loopSnapshot(url.searchParams.get('sessionId') || ''))
+                // 响应发出后才启动后台刷新：冷重扫的同步 IO 段不得堵在本响应的 flush 前面
+                kickInvocableIfStale()
                 return
               }
               if (req.method === 'POST' && apiPath.endsWith('/hermes-loop/api/settings')) {
