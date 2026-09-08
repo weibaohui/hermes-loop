@@ -1160,7 +1160,9 @@ module.exports = {
         let finalText = ''
         let liveText = ''
         const pump = () => {
-          for (const ev of agent.session.events) {
+          // 事件数组防御性取用：spill/裁剪下可能非数组（真机抓过：裸迭代把整个宿主打死）
+          const evs = Array.isArray(agent.session && agent.session.events) ? agent.session.events : []
+          for (const ev of evs) {
             if (ev.seq < firstSeq) continue
             if (ev.type === 'assistant/message' && ev.data && ev.data.message) {
               const text = contentToText(ev.data.message.content)
