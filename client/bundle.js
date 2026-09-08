@@ -470,7 +470,7 @@ window.__ModuleLoader__.load({
                   return h('li', { key: i },
                     h('span', { className: 'hl-tag' }, t('action.' + (w.action || 'create'))),
                     h('span', { className: 'hl-skill' }, w.skill),
-                    h('span', { className: 'hl-mut' }, fmtTime(w.at)),
+                    h('span', { className: 'hl-mut' }, fmtDate(w.at)),
                     w.result && w.result !== 'created' && w.result !== 'patched'
                       ? h('span', { className: 'hl-err hl-mut' }, w.result) : null,
                     w.path ? h('span', { className: 'hl-path' }, w.path) : null)
@@ -501,7 +501,7 @@ window.__ModuleLoader__.load({
                         return h('tr', { key: i, style: zombie ? { opacity: .6 } : null },
                           h('td', { className: 'hl-skill' }, row.skill),
                           h('td', null, zombie ? h('span', { className: 'hl-help hl-mut', 'data-tip': t('usage.statusHelp') }, '—') : row.count),
-                          h('td', { className: 'hl-mut' }, row.lastUsedAt ? fmtTime(row.lastUsedAt) : h('span', { className: 'hl-help', 'data-tip': t('usage.statusHelp') }, '—')),
+                          h('td', { className: 'hl-mut' }, row.lastUsedAt ? fmtDate(row.lastUsedAt) : h('span', { className: 'hl-help', 'data-tip': t('usage.statusHelp') }, '—')),
                           h('td', null, h('span', { className: 'hl-tag' + (row.modelInvocable === false ? ' hl-err' : '') }, statusText)))
                       })))))
                 : h('div', { className: 'hl-mut' }, t('usage.empty')))
