@@ -1160,8 +1160,14 @@ module.exports = {
         let finalText = ''
         let liveText = ''
         const pump = () => {
-          // 事件数组防御性取用：spill/裁剪下可能非数组（真机抓过：裸迭代把整个宿主打死）
-          const evs = Array.isArray(agent.session && agent.session.events) ? agent.session.events : []
+          // 事件列表防御性取用：0.1.5 起移除 events 属性（snapshotEvents() 取代），旧宿主仍是
+          // 数组属性；spill/裁剪下也可能非数组（真机抓过：裸迭代把整个宿主打死）
+          const ses = agent.session
+          const evs = !ses
+            ? []
+            : typeof ses.snapshotEvents === 'function'
+              ? (ses.snapshotEvents() || [])
+              : (Array.isArray(ses.events) ? ses.events : [])
           for (const ev of evs) {
             if (ev.seq < firstSeq) continue
             if (ev.type === 'assistant/message' && ev.data && ev.data.message) {
