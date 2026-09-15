@@ -31,7 +31,8 @@
     "prepublishOnly": "npm run check && npm test"
   },
   "engines": {
-    "node": ">=22.5"
+    "node": ">=22.5",
+    "dsh": ">=0.1.2-rc.1"
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.1"
