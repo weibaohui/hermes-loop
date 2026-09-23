@@ -746,7 +746,7 @@ module.exports = {
   // 静态注入：apply 在这些服务就绪后才运行（at-file 同款模式）。
   // 动态 ctx.inject(['settings'], cb) 在 apply 内不会触发——skills-management 的
   // settings 注册就是这么静默失效的（平台 gotcha）。
-  inject: ['skills', 'settings', 'agents', 'agentDefaultModel', 'systemPrompt', 'sessions'],
+  inject: ['skills', 'settings', 'agents', 'agentDefaultModel', 'systemPrompt', 'sessions', 'connection'],
   __internals: {
     reasonKind, contentToText, renderTranscript, tokenize, rankSuspects,
     extractFencedJson, parseConclusion, parseMemoryConclusion, sha256, buildSkillMd, mergeFrontmatter, applyConclusion,
@@ -1663,6 +1663,14 @@ module.exports = {
           kind: 'prefix',
           path: '/hermes-loop/api',
           handler: async (req, res) => {
+            // 与其它 host 路由一致的信任栅栏：connection 服务的 Host/Origin 检查
+            // 加浏览器认证，防止本机任意网页跨站调用。
+            const rejection = ctx.connection.requestRejection(req)
+            if (rejection !== undefined) {
+              res.writeHead(rejection)
+              res.end()
+              return
+            }
             try {
               const url = new URL(req.url || '/', 'http://dsh.local')
               const apiPath = url.pathname.replace(/\/+$/, '')

@@ -181,6 +181,8 @@ function setupPlugin(config, services) {
   const routes = []
   const ctx = {
     logger: { info: (m) => infos.push(String(m)), warn: (m) => warns.push(String(m)) },
+    // 信任栅栏：默认放行（undefined）；用例可用 services.connection 覆盖为 401/403
+    connection: { requestRejection: () => undefined },
     on: (name, fn) => { handlers.push(fn); return () => {} },
     effect: (fn) => { cleanups.push(fn()) },
     skills: { snapshot: async () => ({ skills: [{ name: 'known-skill', description: 'a known skill about deploys', invocation: { modelInvocable: true } }], complete: true }) },
@@ -303,6 +305,18 @@ function fakeRes() {
   res.end = (b) => { res.body = b }
   return res
 }
+
+test('every route sits behind the connection trust fence', async () => {
+  const services = fakeServices('```json\n{"action":"nothing"}\n```')
+  services.connection = { requestRejection: () => 401 }
+  const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'log-only' }, services)
+  await new Promise((r) => setTimeout(r, 30))
+  assert.equal(t.routes.length, 1)
+  const req = { method: 'GET', url: '/hermes-loop/api/status', headers: {} }
+  const res = fakeRes()
+  t.routes[0].handler(req, res)
+  assert.equal(res.statusCode, 401, 'unauthenticated status read is refused')
+})
 
 test('GET /hermes-loop/api/status exposes settings, per-session counters and written skills', async () => {
   const home = await mkdtemp(join(tmpdir(), 'hermes-loop-api-'))
