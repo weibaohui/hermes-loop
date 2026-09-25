@@ -393,20 +393,73 @@ test('GET /status never blocks on a slow skills.snapshot (panel opens instantly)
   }
 })
 
-test('POST /hermes-loop/api/settings patches mode via settings scope', async () => {
+// 0.1.7-style settings 服务桩：describe() 投影 volatile 值，update() 落到
+// store（可注入故障），document-updated 事件手动触发。
+function makeSettingsService({ failUpdate, initial } = {}) {
   const updates = []
-  const scope = { get: () => ({ mode: 'approval' }), update: async (patch) => { updates.push(patch) } }
+  const listeners = []
+  const store = { ...(initial || {}) }
+  return {
+    updates, listeners, store,
+    describe: () => [{ ns: 'hermes-loop', value: { ...store }, user: { ...store } }],
+    update: async (ns, patch) => {
+      if (ns !== 'hermes-loop') throw new Error(`No configurable plugin entry "${ns}"`)
+      if (failUpdate) throw new Error(failUpdate)
+      updates.push({ ...patch })
+      Object.assign(store, patch)
+    },
+    emitDocumentUpdated: (ns) => listeners.forEach((fn) => fn(ns)),
+  }
+}
+
+test('POST /hermes-loop/api/settings persists the patch via ctx.settings.update (0.1.7)', async () => {
   const services = fakeServices('```json\n{"action":"nothing"}\n```')
-  const t = setupPlugin({ turnInterval: 5 }, { ...services, settings: { register: () => scope } })
+  const settings = makeSettingsService()
+  const t = setupPlugin({ turnInterval: 5 }, { ...services, settings })
   await new Promise((r) => setTimeout(r, 20))
   const route = t.routes[0]
   const res = fakeRes()
   await route.handler(reqBody({ patch: { mode: 'approval' } }), res)
   const body = JSON.parse(res.body)
   assert.equal(res.statusCode, 200)
-  assert.deepEqual(updates, [{ mode: 'approval' }])
+  assert.deepEqual(settings.updates, [{ mode: 'approval' }])
   assert.equal(body.settings.mode, 'approval')
 })
+
+test('GET /status reflects live settings from the settings document (0.1.7 describe)', async () => {
+  const services = fakeServices('```json\n{"action":"nothing"}\n```')
+  const settings = makeSettingsService({ initial: { mode: 'log-only', cooldownMinutes: 7 } })
+  const t = setupPlugin({}, { ...services, settings })
+  await new Promise((r) => setTimeout(r, 20))
+  const res = fakeRes()
+  await t.routes[0].handler(makeGet('/hermes-loop/api/status'), res)
+  const body = JSON.parse(res.body)
+  assert.equal(res.statusCode, 200)
+  assert.equal(body.settings.mode, 'log-only', 'values from the settings document win over base config')
+  assert.equal(body.settings.cooldownMinutes, 7)
+})
+
+test('POST /settings survives a failing settings service via the in-memory fallback', async () => {
+  const services = fakeServices('```json\n{"action":"nothing"}\n```')
+  const settings = makeSettingsService({ failUpdate: 'No configurable plugin entry "hermes-loop"' })
+  const t = setupPlugin({}, { ...services, settings })
+  await new Promise((r) => setTimeout(r, 20))
+  const res = fakeRes()
+  await t.routes[0].handler(reqBody({ patch: { mode: 'approval', cooldownMinutes: 3 } }), res)
+  const body = JSON.parse(res.body)
+  assert.equal(res.statusCode, 200)
+  assert.equal(body.settings.mode, 'approval', 'the merge still applies for this run')
+  assert.equal(body.settings.cooldownMinutes, 3)
+  assert.equal(settings.updates.length, 0, 'the failed update must not be recorded')
+  assert.ok(t.warns.some((w) => w.includes('仅本次运行生效')), 'the fallback is announced')
+})
+
+function makeGet(url) {
+  const req = new (require('node:events').EventEmitter)()
+  req.method = 'GET'
+  req.url = url
+  return req
+}
 
 function reqBody(obj) {
   const data = JSON.stringify(obj)

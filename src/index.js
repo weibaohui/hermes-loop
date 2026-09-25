@@ -120,34 +120,38 @@ const DEFAULTS = {
   userCharLimit: 1375,        // ≈500 tok
 }
 
-function settingsSchema() {
-  if (!Schema) return null
-  return Schema.object({
-    enabled: Schema.boolean().default(true),
-    mode: Schema.union(['auto', 'approval', 'log-only']).default('auto'),
-    provider: Schema.string().default(''),
-    model: Schema.string().default(''),
-    turnInterval: Schema.number().min(1).default(10),
-    toolCallInterval: Schema.number().min(0).default(10),
-    cooldownMinutes: Schema.number().min(0).default(30),
-    maxTranscriptChars: Schema.number().min(1000).default(12000),
-    reviewTimeoutSec: Schema.number().min(30).default(300),
-    catalogDescriptionMax: Schema.number().min(50).default(500),
-    suspectsTopN: Schema.number().min(0).max(10).default(3),
-    maxTranscriptMessages: Schema.number().min(5).max(400).default(40),
-    curatorEnabled: Schema.boolean().default(true),
-    curatorStaleDays: Schema.number().min(1).default(30),
-    curatorArchiveDays: Schema.number().min(2).default(90),
-    curatorIntervalHours: Schema.number().min(1).default(24),
-    signalTriggerEnabled: Schema.boolean().default(true),
-    signalToolFailureMin: Schema.number().min(0).default(3),
-    signalCorrectionWords: Schema.string().default(DEFAULT_CORRECTION_WORDS),
-    memoryEnabled: Schema.boolean().default(true),
-    userProfileEnabled: Schema.boolean().default(true),
-    memoryCharLimit: Schema.number().min(200).default(2200),
-    userCharLimit: Schema.number().min(200).default(1375),
+// 0.1.7 settings 服务：字段标 .volatile() 才能被设置 UI 投影、才能经
+// ctx.settings.update 在线写回（对齐 dsh-webdav-server / dsh-settings-ui）。
+function settingsSchema(S) {
+  if (!S || typeof S.object !== 'function') return null
+  return S.object({
+    enabled: S.boolean().default(true).volatile(),
+    mode: S.union(['auto', 'approval', 'log-only']).default('auto').volatile(),
+    provider: S.string().default('').volatile(),
+    model: S.string().default('').volatile(),
+    turnInterval: S.number().min(1).default(10).volatile(),
+    toolCallInterval: S.number().min(0).default(10).volatile(),
+    cooldownMinutes: S.number().min(0).default(30).volatile(),
+    maxTranscriptChars: S.number().min(1000).default(12000).volatile(),
+    reviewTimeoutSec: S.number().min(30).default(300).volatile(),
+    catalogDescriptionMax: S.number().min(50).default(500).volatile(),
+    suspectsTopN: S.number().min(0).max(10).default(3).volatile(),
+    maxTranscriptMessages: S.number().min(5).max(400).default(40).volatile(),
+    curatorEnabled: S.boolean().default(true).volatile(),
+    curatorStaleDays: S.number().min(1).default(30).volatile(),
+    curatorArchiveDays: S.number().min(2).default(90).volatile(),
+    curatorIntervalHours: S.number().min(1).default(24).volatile(),
+    signalTriggerEnabled: S.boolean().default(true).volatile(),
+    signalToolFailureMin: S.number().min(0).default(3).volatile(),
+    signalCorrectionWords: S.string().default(DEFAULT_CORRECTION_WORDS).volatile(),
+    memoryEnabled: S.boolean().default(true).volatile(),
+    userProfileEnabled: S.boolean().default(true).volatile(),
+    memoryCharLimit: S.number().min(200).default(2200).volatile(),
+    userCharLimit: S.number().min(200).default(1375).volatile(),
   })
 }
+// 0.1.7 loader 通过 entry.fiber.runtime.Config 自动发现 schema，必须在模块顶层导出。
+const Config = settingsSchema(Schema)
 
 /** `$DSH_HOME`-aware roots, mirroring skills-management's installedDir logic. */
 function dshHome() {
@@ -747,11 +751,13 @@ module.exports = {
   // 动态 ctx.inject(['settings'], cb) 在 apply 内不会触发——skills-management 的
   // settings 注册就是这么静默失效的（平台 gotcha）。
   inject: ['skills', 'settings', 'agents', 'agentDefaultModel', 'systemPrompt', 'sessions', 'connection'],
+  Config,
   __internals: {
     reasonKind, contentToText, renderTranscript, tokenize, rankSuspects,
     extractFencedJson, parseConclusion, parseMemoryConclusion, sha256, buildSkillMd, mergeFrontmatter, applyConclusion,
     descriptionOf, atomicWrite, DEFAULTS, dshHome, globalSkillsDir, pendingDir,
     setModelInvocation, curatorTransitions, parseCorrectionWords, matchCorrectionWord, sanitizeSettingsPatch,
+    settingsSchema, Config,
     memoryDir, memoryStoreFile, memoryStoreEnabled, memoryStoreLimit, normalizeEntry,
     parseMemoryEntries, serializeMemoryEntries, scanMemoryEntry, planMemoryChange,
     applyMemoryConclusion, renderMemoryContext,
@@ -760,28 +766,51 @@ module.exports = {
   apply(ctx, config = {}) {
     const trace = makeTracer()
     trace('armed', { pid: process.pid, config: { ...DEFAULTS, ...config } })
-    let settingsScope = null
-    const schema = settingsSchema()
-    if (schema && ctx.settings && typeof ctx.settings.register === 'function') {
-      try {
-        settingsScope = ctx.settings.register('hermes-loop', schema, { base: { ...DEFAULTS, ...config } })
-        trace('settings-registered', {})
-      }
-      catch (e) {
-        trace('settings-register-failed', { message: String(e && e.message || e) })
-        ctx.logger.warn(`hermes-loop: settings register: ${e && e.message}`)
-      }
-    } else {
-      trace('settings-register-skipped', { schema: Boolean(schema), schemaRequireError, settingsType: typeof ctx.settings })
-    }
+    // ── 0.1.7 settings 接线（对齐 dsh-settings-ui / dsh-webdav-server）──
+    // settings 服务不再支持 ctx.settings.register：改为模块顶层导出 volatile
+    // Config（宿主自动发现 + 自动生成设置页），读走 describe() 投影，写走
+    // ctx.settings.update()（持久化进 profile patch，重启不丢）。服务缺席或
+    // 写回失败时退回进程内兜底（仅本次运行有效）。
+    const SETTINGS_NS = 'hermes-loop'
+    const base = { ...DEFAULTS, ...(config || {}) }
+    let liveSettings = {} // settings 文档实时值（document-updated 事件驱动刷新）
+    let memoryPatch = {} // 进程内兜底：写回缺席/失败时保本次运行一致
 
-    const effective = () => {
-      if (settingsScope && typeof settingsScope.get === 'function') {
-        const v = settingsScope.get()
-        if (v && typeof v === 'object') return { ...DEFAULTS, ...config, ...v }
-      }
-      return { ...DEFAULTS, ...config }
+    function readDescriptor() {
+      try {
+        if (!ctx.settings || typeof ctx.settings.describe !== 'function') return null
+        return ctx.settings.describe().find((x) => x.ns === SETTINGS_NS) || null
+      } catch { return null }
     }
+    // apply 时 loader 可能尚未就绪（describe 投影里还没有本插件条目），间隔重试
+    let liveSeen = false
+    function refreshLive(attempt = 0) {
+      const d = readDescriptor()
+      if (d) {
+        if (!liveSeen) trace('settings-live-ready', {})
+        liveSeen = true
+        if (d.value && typeof d.value === 'object') liveSettings = d.value
+        return
+      }
+      if (attempt < 15) setTimeout(() => { refreshLive(attempt + 1) }, 2000).unref?.()
+    }
+    refreshLive()
+
+    const effective = () => ({ ...base, ...liveSettings, ...memoryPatch })
+
+    // settings 文档变更（dsh 自动生成的设置页、本插件面板写回）刷新实时值
+    try {
+      if (ctx.on && typeof ctx.on === 'function') {
+        ctx.effect(() => {
+          const off = ctx.on('settings/document-updated', (ns) => {
+            if (ns !== SETTINGS_NS) return
+            const d = readDescriptor()
+            if (d && d.value && typeof d.value === 'object') liveSettings = d.value
+          })
+          return () => { try { off() } catch {} }
+        }, 'hermes-loop: settings watch')
+      }
+    } catch { /* 事件订阅不可用：写回后靠 memoryPatch 维持本次运行 */ }
 
     // ── In-session patch 纪律 section（design §5，辅助非依赖）──
     // hermes-prompt 已装（ctx.provide 标记）则跳过——其纪律宣言已覆盖同款要求，
@@ -1686,8 +1715,12 @@ module.exports = {
                   sendJson(res, 400, { error: 'body must provide patch object' })
                   return
                 }
-                if (settingsScope && typeof settingsScope.update === 'function') await settingsScope.update(body.patch)
-                else Object.assign(config, sanitizeSettingsPatch(body.patch)) // 无 settings 服务时的降级路径也要校验
+                const patch = sanitizeSettingsPatch(body.patch)
+                memoryPatch = { ...memoryPatch, ...patch }
+                if (ctx.settings && typeof ctx.settings.update === 'function') {
+                  try { await ctx.settings.update(SETTINGS_NS, patch) }
+                  catch (e) { ctx.logger.warn(`hermes-loop: settings update 失败（仅本次运行生效）: ${e && e.message}`) }
+                }
                 sendJson(res, 200, { ok: true, settings: effective() })
                 return
               }
