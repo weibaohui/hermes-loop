@@ -743,6 +743,21 @@ function reviewPrompt(eff = {}) {
   ].join('\n')
 }
 
+
+// 0.1.7 宿主 resolveConfig 会把 apply-config 里的 volatile 字段物化成 {}（实测）：
+// {} 会盖掉 DEFAULTS，导致 describe 就绪前/降级路径下拿到毒化值。这里只保留
+// 类型与默认值一致的标量/数组；真实持久化值走 describe 投影（liveSettings）。
+function saneConfigValues(config, defaults) {
+  const out = {}
+  for (const key of Object.keys(defaults)) {
+    const v = (config || {})[key]
+    if (v === undefined || v === null) continue
+    if (Array.isArray(defaults[key])) { if (Array.isArray(v)) out[key] = v; continue }
+    if (typeof v === typeof defaults[key]) out[key] = v
+  }
+  return out
+}
+
 // ── Plugin ──────────────────────────────────────────────────────────────
 
 module.exports = {
@@ -772,7 +787,7 @@ module.exports = {
     // ctx.settings.update()（持久化进 profile patch，重启不丢）。服务缺席或
     // 写回失败时退回进程内兜底（仅本次运行有效）。
     const SETTINGS_NS = 'hermes-loop'
-    const base = { ...DEFAULTS, ...(config || {}) }
+    const base = { ...DEFAULTS, ...saneConfigValues(config, DEFAULTS) }
     let liveSettings = {} // settings 文档实时值（document-updated 事件驱动刷新）
     let memoryPatch = {} // 进程内兜底：写回缺席/失败时保本次运行一致
 
