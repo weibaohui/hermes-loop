@@ -5,7 +5,7 @@
 
 **自动复盘插件**：对话收尾后自动复盘，把有价值的经验蒸馏成可复用的技能（skill），把值得长期记住的事实与偏好写入跨会话记忆。
 
-![Hermes Loop：会话内复盘面板与技能治理](docs/demo.gif)
+![Hermes Loop：会话内复盘面板与技能治理](https://raw.githubusercontent.com/weibaohui/hermes-loop/main/docs/demo.gif)
 
 ## 核心功能
 
