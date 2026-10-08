@@ -219,8 +219,8 @@ const DEFAULTS = {
   userProfileEnabled: true,   // USER.md：画像/偏好；两开关全关 → 协议退回 skill 单结论
   memoryCharLimit: 2200,      // 对齐 Hermes 原版（≈800 tok）
   userCharLimit: 1375,        // ≈500 tok
-  // ── 工作区记忆（design §13，v0.6）：项目事实沉到 per-cwd 库，全局库只留跨项目约定 ──
-  workspaceMemoryEnabled: true,
+  // ── 工作区记忆（design §13，v0.6）：项目事实沉到 per-cwd 库，全局库只留跨项目约定。
+  // 无开关、常开；落全局还是落工作区由复盘 agent 经结论的 scope 字段决定 ──
 }
 
 // 0.1.7 settings 服务：字段标 .volatile() 才能被设置 UI 投影、才能经
@@ -251,7 +251,6 @@ function settingsSchema(S) {
     userProfileEnabled: S.boolean().default(true).volatile(),
     memoryCharLimit: S.number().min(200).default(2200).volatile(),
     userCharLimit: S.number().min(200).default(1375).volatile(),
-    workspaceMemoryEnabled: S.boolean().default(true).volatile(),
   })
 }
 // 0.1.7 loader 通过 entry.fiber.runtime.Config 自动发现 schema，必须在模块顶层导出。
@@ -859,7 +858,6 @@ function sanitizeSettingsPatch(patch) {
   if (typeof patch.userProfileEnabled === 'boolean') out.userProfileEnabled = patch.userProfileEnabled
   num('memoryCharLimit', 200)
   num('userCharLimit', 200)
-  if (typeof patch.workspaceMemoryEnabled === 'boolean') out.workspaceMemoryEnabled = patch.workspaceMemoryEnabled
   return out
 }
 
@@ -926,7 +924,7 @@ const REVIEW_LANGUAGE_DIRECTIVE = {
   en: 'Write every natural-language field (description, body, memory.text, rationale) in English. This follows the user\'s language setting and is independent of whatever language the transcript, skill catalog, or memory entries happen to use.',
 }
 const REVIEW_PROMPT_TEXT = {
-  zh: (memoryOn, workspaceOn) => [
+  zh: (memoryOn) => [
     '你是后台复盘 agent：分析一段刚结束的对话转写，判断其中有没有值得沉淀为 skill 的经验。',
     '',
     '## 主动倾向',
@@ -960,9 +958,7 @@ const REVIEW_PROMPT_TEXT = {
       '- 用户画像、偏好、对你行为方式的期望 → store="user"；',
       '- 环境/项目事实、约定、教训（如"发布必须 OTP""服务跑在 19080 端口"）→ store="memory"；',
       '- 流程、步骤、坑 → 仍归 skill，绝不写进记忆。',
-      ...(workspaceOn ? [
-        '- store="memory" 分两层：只适用当前项目的事实/约定（路径、端口、脚本、项目特有规矩）→ 结论加 "scope": "project"，写入当前工作区库（下方「MEMORY（工作区）」）；跨项目通用的环境事实/约定 → 省略 scope 或写 "global"，写入全局库。replace/remove 的 oldText 按同层库定位。',
-      ] : []),
+      '- store="memory" 分两层：只适用当前项目的事实/约定（路径、端口、脚本、项目特有规矩）→ 结论加 "scope": "project"，写入当前工作区库（下方「MEMORY（工作区）」）；跨项目通用的环境事实/约定 → 省略 scope 或写 "global"，写入全局库。replace/remove 的 oldText 按同层库定位。',
       '按需产出：没有明确值得记的就省略 memory 字段，不为写而写——记忆库是小限额精编清单，平庸条目会挤掉真条目，而漏记几乎零成本。',
       '库接近上限时优先 replace（合并改写既有条目）或 remove（删过时条目），而不是 add。',
       '',
@@ -986,9 +982,7 @@ const REVIEW_PROMPT_TEXT = {
       '  "memory": {                            // 可选；多数复盘应省略整个字段',
       '    "action": "nothing" | "add" | "replace" | "remove",',
       '    "store": "memory" | "user",           // add/replace/remove 必填',
-      ...(workspaceOn ? [
-        '    "scope": "project" | "global",           // 可选；仅 store="memory" 有效，缺省 global',
-      ] : []),
+      '    "scope": "project" | "global",           // 可选；仅 store="memory" 有效，缺省 global',
       '    "text": "新条目，一句话（add/replace 必填）",',
       '    "oldText": "下方记忆条目里唯一命中一条的原文子串（replace/remove 必填）",',
       '    "rationale": "为什么记/改/删" }',
@@ -999,7 +993,7 @@ const REVIEW_PROMPT_TEXT = {
     'body 章节规范：When to Use / Prerequisites / Procedure / Pitfalls / Verification。',
     REVIEW_LANGUAGE_DIRECTIVE.zh,
   ],
-  en: (memoryOn, workspaceOn) => [
+  en: (memoryOn) => [
     'You are the background review agent: analyze a transcript of a just-finished conversation and decide whether it holds experience worth distilling into a skill.',
     '',
     '## Lean toward acting',
@@ -1033,9 +1027,7 @@ const REVIEW_PROMPT_TEXT = {
       '- user profile, preferences, expectations about how you behave → store="user";',
       '- environment/project facts, conventions, lessons (e.g. "releases require OTP", "the service runs on port 19080") → store="memory";',
       '- processes, steps, pitfalls → these remain skills; never write them into memory.',
-      ...(workspaceOn ? [
-        '- store="memory" has two layers: facts/conventions that only apply to the current project (paths, ports, scripts, project-specific rules) → add "scope": "project" to the conclusion, written to the current workspace store (the "MEMORY (workspace)" block below); cross-project environment facts/conventions → omit scope (or use "global") for the global store. oldText of replace/remove is located within the same layer.',
-      ] : []),
+      '- store="memory" has two layers: facts/conventions that only apply to the current project (paths, ports, scripts, project-specific rules) → add "scope": "project" to the conclusion, written to the current workspace store (the "MEMORY (workspace)" block below); cross-project environment facts/conventions → omit scope (or use "global") for the global store. oldText of replace/remove is located within the same layer.',
       'Produce on demand: if nothing is clearly worth keeping, omit the memory field — do not write for the sake of writing. The memory stores are small, tightly-curated lists; mediocre entries crowd out real ones, while a missed entry costs almost nothing.',
       'When a store nears its limit, prefer replace (merge and rewrite an existing entry) or remove (drop a stale entry) over add.',
       '',
@@ -1059,9 +1051,7 @@ const REVIEW_PROMPT_TEXT = {
       '  "memory": {                            // optional; most reviews should omit the whole field',
       '    "action": "nothing" | "add" | "replace" | "remove",',
       '    "store": "memory" | "user",           // required for add/replace/remove',
-      ...(workspaceOn ? [
-        '    "scope": "project" | "global",           // optional; store="memory" only, defaults to global',
-      ] : []),
+      '    "scope": "project" | "global",           // optional; store="memory" only, defaults to global',
       '    "text": "New entry, one sentence (required for add/replace)",',
       '    "oldText": "A substring of the original text that uniquely matches one entry in the memory list below (required for replace/remove)",',
       '    "rationale": "Why record / change / delete" }',
@@ -1079,10 +1069,9 @@ function reviewPrompt(eff = {}, lang) {
     const enabled = s === 'user' ? eff.userProfileEnabled : eff.memoryEnabled
     return enabled !== false
   })
-  // §13 scope 行的门控：显式 true 才出现。undefined（如 parity 测试的 {} 输入）
-  // 视为关——上游逐字断言因此不动；运行时 eff 合并了 DEFAULTS（true），默认即开。
-  const workspaceOn = memoryOn && eff.workspaceMemoryEnabled === true
-  return REVIEW_PROMPT_TEXT[languageOf(lang)](memoryOn, workspaceOn).join('\n')
+  // §13 scope 行随 memory 通道常开（无独立开关，落哪层由复盘 agent 的 scope 决定）；
+  // 与上游 0.1.16 的逐字 parity 由测试侧剥离这两行后维持（zh 指令行同款先例）
+  return REVIEW_PROMPT_TEXT[languageOf(lang)](memoryOn).join('\n')
 }
 
 /**
@@ -1260,10 +1249,10 @@ module.exports = {
       const renderMemorySafe = (lang, cwd) => {
         try {
           const eff = effective()
-          // 工作区层（§13）：开关开 + cwd 已知 + memory 库开，才读 workspaces/<slug>/MEMORY.md；
+          // 工作区层（§13）：常开，cwd 已知 + memory 库开即读 workspaces/<slug>/MEMORY.md；
           // 读盘故障按空库渲染（单层故障不扩散，与全局库同款容错）
           let workspace
-          if (cwd !== undefined && eff.workspaceMemoryEnabled !== false && eff.memoryEnabled !== false) {
+          if (cwd !== undefined && eff.memoryEnabled !== false) {
             let raw = ''
             try {
               const dir = workspaceMemoryDir(cwd)
@@ -1609,8 +1598,8 @@ module.exports = {
             try { raw = await fsP.readFile(memoryStoreFile(store), 'utf8') } catch { /* 新库 */ }
             stores.push({ store, entries: parseMemoryEntries(raw) })
             // 工作区层（§13）：紧跟全局 MEMORY 块之后，空库也注入（让模型知道这层存在，
-            // scope:"project" 的结论才有落点）；cwd 缺席/非法或开关关闭时不出现
-            if (store === 'memory' && eff.workspaceMemoryEnabled !== false) {
+            // scope:"project" 的结论才有落点）；cwd 缺席/非法时不出现
+            if (store === 'memory') {
               const dir = workspaceMemoryDir(cwd)
               if (dir !== undefined) {
                 let wRaw = ''
@@ -1737,10 +1726,10 @@ module.exports = {
       const logHead = hasSkill
         ? `hermes-loop: ${conclusion.action} '${conclusion.skill}' (from session ${sessionId})`
         : `hermes-loop: memory ${conclusion.memory.action}@${conclusion.memory.store} (from session ${sessionId})`
-      // §13 scope 路由：仅 store="memory" + scope="project" + 开关开 + cwd 已知时落工作区库；
-      // 其余（含开关关闭/cwd 缺席的 project 结论）回退全局库——fail-open 保数据，不丢结论
+      // §13 scope 路由：store="memory" + scope="project" + cwd 已知时落工作区库（常开，
+      // 落点由复盘 agent 的 scope 决定）；cwd 缺席的 project 结论回退全局库——fail-open 保数据
       const sessionCwd = session && session.header && typeof session.header.cwd === 'string' ? session.header.cwd : undefined
-      const wsDir = hasMemory && conclusion.memory.store === 'memory' && conclusion.memory.scope === 'project' && eff.workspaceMemoryEnabled !== false
+      const wsDir = hasMemory && conclusion.memory.store === 'memory' && conclusion.memory.scope === 'project'
         ? workspaceMemoryDir(sessionCwd)
         : undefined
       trace('dispatch', {
@@ -2137,7 +2126,7 @@ module.exports = {
           memory.workspaces.push({
             slug,
             cwd: workspaceCwdOf(raw),
-            enabled: eff.workspaceMemoryEnabled !== false && eff.memoryEnabled !== false,
+            enabled: eff.memoryEnabled !== false,
             chars: memoryCharsOf(entries),
             limit: eff.memoryCharLimit,
             entries: entries.length,

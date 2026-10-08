@@ -410,20 +410,20 @@ review prompt 增补（恢复 Hermes memory review 原题，research §5）：�
 - `USER.md` **恒全局**——画像是人的属性，不是项目的；
 - `MEMORY.md` 两层并存：全局层放跨项目约定，工作区层放本项目事实；两层**拼接注入**而非覆盖；
 - 复盘协议给 memory 结论加**可选** `scope: "project" | "global"` 字段（仅 store="memory" 有效，store="user" 恒全局并抹除 scope）：`project` 写工作区库，缺席/`global` 写全局库——**缺省全局**，v0.5 的旧结论与旧 prompt 行为逐字不变（向后兼容）；
-- prompt 增补（仅 `workspaceMemoryEnabled` 开启时出现的门控行）：只适用当前项目的事实/约定 → `"scope": "project"`；跨项目通用约定 → 省略 scope 或 `"global"`；
+- prompt 增补（随 memory 段常开，无独立开关）：只适用当前项目的事实/约定 → `"scope": "project"`；跨项目通用约定 → 省略 scope 或 `"global"`；落哪层由复盘 agent 按结论自行判断；
 - 限额：工作区库独立享受 `memoryCharLimit`（每库 2200）——等于按项目扩容，顺带缓解全局库挤占。
 
 ### 13.4 链路改动点
 
-- **写入侧**：复盘 runner 已有 `session.header.cwd`（§4 输入 2 同款）。结论 `scope==="project"` 且 cwd 已知且开关开 → 目标目录换 `workspaces/<slug>/`；四条写入守卫（§12.4）逐字复用，零改动。开关关闭或 cwd 缺席时 `project` 结论**回退全局库**（fail-open 保数据，不丢结论）。pending JSON 的 `memoryDir` 记实际目标目录并增记 `cwd`。
+- **写入侧**：复盘 runner 已有 `session.header.cwd`（§4 输入 2 同款）。结论 `scope==="project"` 且 cwd 已知 → 目标目录换 `workspaces/<slug>/`；四条写入守卫（§12.4）逐字复用，零改动。cwd 缺席时 `project` 结论**回退全局库**（fail-open 保数据，不丢结论）。pending JSON 的 `memoryDir` 记实际目标目录并增记 `cwd`。
 - **注入侧**：`hermes:memory` 的 text 函数在会话首冻结时从 `scope.session.header.cwd`（assemble 的 scope 即 agent 对象，dsh-agent dispatch.js `assembleContextFor` 返回 `{ agent, scope: agent }`；`agent.session` 是公开字段）推导 slug，追加渲染工作区小节（标题带 cwd 标注）；读盘故障同 §12.2 容错为空。冻结语义、缓存论证、空快照过滤全部不变。
 - **复盘输入**：§12.3 的"当前记忆条目"块追加工作区库小节（`### MEMORY（工作区）`），oldText 唯一定位按结论 scope 选库——review agent 同时看到两层才能正确 replace/remove 既有条目。
-- **i18n parity**：上述新文案全部走"可选第四参/门控行"，默认输入下 `renderMemoryContext`/`reviewPrompt` 与上游逐字一致，既有 parity 断言不动；新增文案的 zh/en 键对偶与纯 ASCII 纪律由新断言钉住。
+- **i18n parity**：`renderMemoryContext` 的工作区层走可选第四参（缺席时与上游逐字一致，parity 断言不动）；`reviewPrompt` 的两行 scope 文案随 memory 段常开，zh parity 沿用"剥离有意新增行后逐字比对"的既有先例（zh 指令行同款），en 侧全量 pin 直接更新；新文案的 zh/en 键对偶与纯 ASCII 纪律由新断言钉住。
 - **面板**：status 的 `memory` 节新增 `workspaces: [{ slug, cwd, chars, limit, entries, items }]`（枚举 `workspaces/*`，上限 50 个，cwd 读文件头注释）；客户端 bundle 本仓库无源码，UI 展示留给后续，状态接口先行。
 
 ### 13.5 配置
 
-`workspaceMemoryEnabled: true`（volatile，面板可关）。关闭时：不写工作区库（project 结论回退全局）、不注入工作区层、复盘 prompt 不出现 scope 行。全局双库开关语义不变。
+**无独立开关，常开**（2026-10-09 用户拍板）：落全局还是落工作区由复盘 agent 经结论的 `scope` 字段自行判断，不需要用户决策。`memoryEnabled` 仍是总闸——它关掉时全局 MEMORY 层与工作区层一起关闭（工作区层只是 MEMORY 库的分层，不是第三条通道）。
 
 ### 13.6 明确不做与边界
 

@@ -152,6 +152,19 @@ test('the default language is upstream 0.1.16, verified by running upstream', or
     assert.ok(text.endsWith(line), 'the zh prompt must end with the output-language directive')
     return text.slice(0, -line.length)
   }
+  // §13 (v0.6) adds two more deliberate lines to the zh branch whenever the
+  // memory channel is on: the two-layer routing bullet in the Memory section
+  // and the "scope" example line in the conclusion schema. Same discipline as
+  // the directive strip: pin the exact additions by pulling them out of the
+  // current zh array (so they exist and are singular), remove exactly those
+  // lines, and leave every other character under the upstream comparison.
+  const zhNow = I.REVIEW_PROMPT_TEXT.zh(true)
+  const scopeLineOf = (lines) => lines.filter((l) => l.includes('"scope": "project" | "global",'))
+  const bulletLineOf = (lines) => lines.filter((l) => l.startsWith('- store="memory" 分两层'))
+  assert.equal(scopeLineOf(zhNow).length, 1, 'exactly one scope example line may exist in the zh prompt')
+  assert.equal(bulletLineOf(zhNow).length, 1, 'exactly one two-layer bullet may exist in the zh prompt')
+  const stripScopeLines = (text) =>
+    text.split('\n').filter((l) => !scopeLineOf([l]).length && !bulletLineOf([l]).length).join('\n')
   for (const eff of [
     { memoryEnabled: true, userProfileEnabled: true },
     { memoryEnabled: true, userProfileEnabled: false },
@@ -160,11 +173,11 @@ test('the default language is upstream 0.1.16, verified by running upstream', or
     {},
   ]) {
     assert.equal(
-      stripDirective(I.reviewPrompt(eff)),
+      stripDirective(stripScopeLines(I.reviewPrompt(eff))),
       upstream().reviewPrompt(eff),
       `zh output drifted from upstream for ${JSON.stringify(eff)}`,
     )
-    assert.equal(stripDirective(I.reviewPrompt(eff, 'zh')), upstream().reviewPrompt(eff))
+    assert.equal(stripDirective(stripScopeLines(I.reviewPrompt(eff, 'zh'))), upstream().reviewPrompt(eff))
   }
 
   // The memory snapshot is injected into every session rather than only into the
@@ -191,7 +204,7 @@ test('the default language is upstream 0.1.16, verified by running upstream', or
   }
 
   // And assert undefined explicitly means zh, so no caller needs a sentinel.
-  assert.equal(stripDirective(I.reviewPrompt({})), upstream().reviewPrompt({}))
+  assert.equal(stripDirective(stripScopeLines(I.reviewPrompt({}))), upstream().reviewPrompt({}))
 
   // The loop-aware section is injected into every session's system prompt and
   // upstream does not export it, so compare against the array it assembles —
@@ -494,6 +507,8 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     '- user profile, preferences, expectations about how you behave → store="user";',
     '- environment/project facts, conventions, lessons (e.g. "releases require OTP", "the service runs on port 19080") → store="memory";',
     '- processes, steps, pitfalls → these remain skills; never write them into memory.',
+    // §13 (v0.6): the two-layer routing line ships unconditionally with the memory section
+    '- store="memory" has two layers: facts/conventions that only apply to the current project (paths, ports, scripts, project-specific rules) → add "scope": "project" to the conclusion, written to the current workspace store (the "MEMORY (workspace)" block below); cross-project environment facts/conventions → omit scope (or use "global") for the global store. oldText of replace/remove is located within the same layer.',
     'Produce on demand: if nothing is clearly worth keeping, omit the memory field — do not write for the sake of writing. The memory stores are small, tightly-curated lists; mediocre entries crowd out real ones, while a missed entry costs almost nothing.',
     'When a store nears its limit, prefer replace (merge and rewrite an existing entry) or remove (drop a stale entry) over add.',
     '',
@@ -513,6 +528,7 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     '  "memory": {                            // optional; most reviews should omit the whole field',
     '    "action": "nothing" | "add" | "replace" | "remove",',
     '    "store": "memory" | "user",           // required for add/replace/remove',
+    '    "scope": "project" | "global",           // optional; store="memory" only, defaults to global',
     '    "text": "New entry, one sentence (required for add/replace)",',
     '    "oldText": "A substring of the original text that uniquely matches one entry in the memory list below (required for replace/remove)",',
     '    "rationale": "Why record / change / delete" }',
@@ -846,12 +862,13 @@ test('the memory block drops its section when both stores are off, in both langu
   assert.match(I.reviewPrompt(off, 'en'), /not distilled this round/)
 })
 // ── §13 (v0.6) workspace memory copy ──────────────────────────────────────
-// The gated copy only appears when workspaceMemoryEnabled is explicitly true,
-// so the upstream-parity assertions above (whose inputs never carry the flag)
-// keep pinning the v0.5 text byte-for-byte. This block pins the new copy.
+// The scope copy ships unconditionally with the memory section (no toggle —
+// the review agent decides project vs global per conclusion). The upstream
+// parity loop above keeps pinning the v0.5 text by stripping exactly these
+// lines; this block pins the new copy itself.
 
-test('workspace scope lines: zh/en mirror each other, gated on workspaceMemoryEnabled', () => {
-  const on = { memoryEnabled: true, userProfileEnabled: true, workspaceMemoryEnabled: true }
+test('workspace scope lines: zh/en mirror each other and ship with the memory section', () => {
+  const on = { memoryEnabled: true, userProfileEnabled: true }
   const zh = I.reviewPrompt(on, 'zh')
   const en = I.reviewPrompt(on, 'en')
 
@@ -872,9 +889,8 @@ test('workspace scope lines: zh/en mirror each other, gated on workspaceMemoryEn
   assert.ok(zhLines[zhLines.indexOf(zhLines.find(scopeLine)) - 1].trimStart().startsWith('"store"'), 'zh scope line follows the store line')
   assert.ok(enLines[enLines.indexOf(enLines.find(scopeLine)) - 1].trimStart().startsWith('"store"'), 'en scope line follows the store line')
 
-  // Gated off → byte-identical base text (the parity loop above covers this via
-  // flag-less inputs; here the flag is explicit).
-  const off = { memoryEnabled: true, userProfileEnabled: true, workspaceMemoryEnabled: false }
+  // Memory channel fully off → the scope copy leaves with the whole section.
+  const off = { memoryEnabled: false, userProfileEnabled: false }
   assert.ok(!I.reviewPrompt(off, 'zh').includes('"scope"'))
   assert.ok(!I.reviewPrompt(off, 'en').includes('"scope"'))
 

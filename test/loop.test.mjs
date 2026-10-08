@@ -1605,17 +1605,18 @@ test('renderReviewMemoryBlock 工作区变体：标题换 MEMORY（工作区）�
   assert.match(userVariant, /### USER（1 条）/)
 })
 
-test('reviewPrompt scope 门控（§13）：显式 true 才出现 scope 行；缺席/false/记忆关 都不出现', () => {
-  const on = plugin.__internals.reviewPrompt({ memoryEnabled: true, workspaceMemoryEnabled: true })
+test('reviewPrompt scope 行（§13）：记忆通道开即常出现（无独立开关）；两库全关才消失', () => {
+  const on = plugin.__internals.reviewPrompt({ memoryEnabled: true })
   assert.ok(on.includes('"scope": "project" | "global"'), 'zh prompt carries the scope protocol line')
   assert.ok(on.includes('MEMORY（工作区）'), 'zh prompt explains the workspace layer')
-  const off = plugin.__internals.reviewPrompt({ memoryEnabled: true })
-  assert.ok(!off.includes('"scope"'), 'undefined flag → no scope lines (upstream parity)')
-  const off2 = plugin.__internals.reviewPrompt({ memoryEnabled: true, workspaceMemoryEnabled: false })
-  assert.ok(!off2.includes('"scope"'), 'explicit false → no scope lines')
-  const memoryOff = plugin.__internals.reviewPrompt({ memoryEnabled: false, userProfileEnabled: false, workspaceMemoryEnabled: true })
-  assert.ok(!memoryOff.includes('"scope"'), 'memory channel off → scope lines off even when workspace flag on')
-  const en = plugin.__internals.reviewPrompt({ memoryEnabled: true, workspaceMemoryEnabled: true }, 'en')
+  // 只开 user 库也算记忆通道开——scope 行只对 store="memory" 有意义，但协议示例
+  // 与分层指引是 memory 段的一部分，随段出现（store="memory" 的结论此时会被
+  // store-disabled 守卫拒掉，行为一致）
+  const userOnly = plugin.__internals.reviewPrompt({ memoryEnabled: false, userProfileEnabled: true })
+  assert.ok(userOnly.includes('"scope": "project" | "global"'))
+  const memoryOff = plugin.__internals.reviewPrompt({ memoryEnabled: false, userProfileEnabled: false })
+  assert.ok(!memoryOff.includes('"scope"'), 'memory channel fully off → no scope lines')
+  const en = plugin.__internals.reviewPrompt({ memoryEnabled: true }, 'en')
   assert.ok(en.includes('"scope": "project" | "global"'))
   assert.ok(en.includes('MEMORY (workspace)'))
   assert.ok(!/[\u3000-\u303f\uff00-\uffef\u4e00-\u9fff]/.test(en), 'en prompt with scope lines stays CJK-free')
@@ -1652,38 +1653,22 @@ test('memory e2e: scope:project 写入工作区库（带 cwd 头注释），全�
   }
 })
 
-test('memory e2e: scope:project 在 cwd 缺席或开关关闭时回退全局库（fail-open 保数据）', async () => {
+test('memory e2e: scope:project 在 cwd 缺席时回退全局库（fail-open 保数据）', async () => {
   const conclusion = JSON.stringify({
     action: 'nothing',
     memory: { action: 'add', store: 'memory', scope: 'project', text: 'fallback fact' },
   })
   // cwd 缺席（header {}）→ 全局库
-  {
-    const { home, oldHome } = await runE2E({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, conclusion)
-    try {
-      assert.match(await readFile(join(home, 'memory', 'MEMORY.md'), 'utf8'), /§ fallback fact/)
-      let wsAbsent = false
-      try { await readdir(join(home, 'memory', 'workspaces')) } catch { wsAbsent = true }
-      assert.ok(wsAbsent, 'no workspace dir may be created without cwd')
-    } finally {
-      if (oldHome === undefined) delete process.env.DSH_HOME
-      else process.env.DSH_HOME = oldHome
-      await rm(home, { recursive: true, force: true })
-    }
-  }
-  // 开关关闭 → 全局库
-  {
-    const { home, oldHome } = await runE2E({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto', workspaceMemoryEnabled: false }, conclusion, { cwd: '/tmp/fake-ws-off' })
-    try {
-      assert.match(await readFile(join(home, 'memory', 'MEMORY.md'), 'utf8'), /§ fallback fact/)
-      let wsAbsent = false
-      try { await readdir(join(home, 'memory', 'workspaces')) } catch { wsAbsent = true }
-      assert.ok(wsAbsent, 'workspaceMemoryEnabled=false routes project conclusions to the global store')
-    } finally {
-      if (oldHome === undefined) delete process.env.DSH_HOME
-      else process.env.DSH_HOME = oldHome
-      await rm(home, { recursive: true, force: true })
-    }
+  const { home, oldHome } = await runE2E({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, conclusion)
+  try {
+    assert.match(await readFile(join(home, 'memory', 'MEMORY.md'), 'utf8'), /§ fallback fact/)
+    let wsAbsent = false
+    try { await readdir(join(home, 'memory', 'workspaces')) } catch { wsAbsent = true }
+    assert.ok(wsAbsent, 'no workspace dir may be created without cwd')
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
   }
 })
 
@@ -1753,21 +1738,23 @@ test('memory context 工作区层注入（§13）：会话首冻结按 cwd 拼�
   }
 })
 
-test('memory context 工作区层：workspaceMemoryEnabled=false 时不读工作区库', async () => {
+test('memory context 工作区层：memoryEnabled=false 时全局 MEMORY 与工作区层一起关闭', async () => {
   const home = await mkdtemp(join(tmpdir(), 'hermes-loop-wsoff-'))
   const oldHome = process.env.DSH_HOME
   process.env.DSH_HOME = home
   try {
     const cwd = '/tmp/proj-off'
     await mkdir(join(home, 'memory', 'workspaces', workspaceSlug(cwd)), { recursive: true })
-    await writeFile(join(home, 'memory', 'workspaces', workspaceSlug(cwd), 'MEMORY.md'), '# MEMORY\n\n§ off fact\n')
+    await writeFile(join(home, 'memory', 'MEMORY.md'), '# MEMORY\n\n§ global off fact\n')
+    await writeFile(join(home, 'memory', 'workspaces', workspaceSlug(cwd), 'MEMORY.md'), '# MEMORY\n\n§ ws off fact\n')
     const contexts = []
     const services = fakeServices('```json\n{"action":"nothing"}\n```')
     services.systemPrompt = { section: () => {}, context: (c) => contexts.push(c) }
-    setupPlugin({ turnInterval: 999, workspaceMemoryEnabled: false }, services)
+    setupPlugin({ turnInterval: 999, memoryEnabled: false }, services)
     const memCtx = contexts.find((c) => c.name === 'hermes:memory')
     const snap = memCtx.text({ scope: { session: { header: { cwd } } } })
-    assert.doesNotMatch(snap, /off fact/)
+    assert.doesNotMatch(snap, /global off fact/)
+    assert.doesNotMatch(snap, /ws off fact/)
     assert.doesNotMatch(snap, /工作区/)
   } finally {
     if (oldHome === undefined) delete process.env.DSH_HOME
