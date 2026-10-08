@@ -1281,7 +1281,7 @@ test('memory context: session-frozen snapshots (Hermes semantics) — mid-sessio
   }
 })
 
-async function runE2E(config, conclusionText) {
+async function runE2E(config, conclusionText, header = {}) {
   const home = await mkdtemp(join(tmpdir(), 'hermes-loop-mem-e2e-'))
   const oldHome = process.env.DSH_HOME
   process.env.DSH_HOME = home
@@ -1290,7 +1290,7 @@ async function runE2E(config, conclusionText) {
   const t = setupPlugin(config, services)
   const session = {
     id: 'session-mem-e2e',
-    header: {},
+    header,
     deriveMessages: () => [{ role: 'user', content: 'do the thing' }],
     append: (type, data) => notices.push(data),
   }
@@ -1491,6 +1491,315 @@ test('v0.5 追加：status 的 memory.items 带只读条目原文', async () => 
     assert.deepEqual(body.memory.stores.memory.items, ['fact for items'])
     assert.deepEqual(body.memory.stores.user.items, [])
     assert.equal(body.memory.stores.memory.entries, 1) // entries 仍是计数
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+// ── 工作区记忆（design §13，v0.6）──────────────────────────────────────────
+
+const {
+  workspaceSlug, workspaceMemoryDir, workspaceCwdHeader, workspaceCwdOf, scopeCwd,
+  renderReviewMemoryBlock,
+} = plugin.__internals
+
+test('workspaceSlug: cwd 折成 Claude 风格 slug；空/非法输入返回 undefined；超长截断带哈希', () => {
+  assert.equal(workspaceSlug('/Users/mac/projects/ts/dsh-plugins'), '-Users-mac-projects-ts-dsh-plugins')
+  assert.equal(workspaceSlug('C:\\code\\proj'), 'C--code-proj')
+  assert.equal(workspaceSlug('/x'), '-x')
+  assert.equal(workspaceSlug(undefined), undefined)
+  assert.equal(workspaceSlug(''), undefined)
+  assert.equal(workspaceSlug('   '), undefined)
+  assert.equal(workspaceSlug(42), undefined)
+  // 超长路径：≤128 字符、带 8 位哈希后缀、同输入确定性
+  const longCwd = '/very/' + 'deep/'.repeat(40) + 'leaf'
+  const slug = workspaceSlug(longCwd)
+  assert.ok(slug.length <= 128, `slug length ${slug.length} must be ≤128`)
+  assert.equal(slug, workspaceSlug(longCwd), 'deterministic')
+  assert.notEqual(slug, workspaceSlug(longCwd + '2'), 'different paths must not collide on the prefix')
+  assert.match(slug, /-[0-9a-f]{8}$/, 'truncated slug carries an 8-char hash suffix')
+})
+
+test('workspaceMemoryDir 与 cwd 头注释：目录解析、slug 不可逆时的自描述回读', () => {
+  const dir = workspaceMemoryDir('/Users/mac/proj')
+  assert.equal(dir, join(process.env.DSH_HOME, 'memory', 'workspaces', '-Users-mac-proj'))
+  assert.equal(workspaceMemoryDir(undefined), undefined)
+  assert.equal(workspaceCwdOf(`# MEMORY\n${workspaceCwdHeader('/Users/mac/proj')}\n\n§ a\n`), '/Users/mac/proj')
+  assert.equal(workspaceCwdOf('# MEMORY\n\n§ a\n'), undefined)
+})
+
+test('scopeCwd: 从 agent scope 的 session.header.cwd 提取；任何一环缺席都按无 cwd 处理', () => {
+  assert.equal(scopeCwd({ session: { header: { cwd: '/a/b' } } }), '/a/b')
+  assert.equal(scopeCwd({ session: { header: {} } }), undefined)
+  assert.equal(scopeCwd({ session: {} }), undefined)
+  assert.equal(scopeCwd({}), undefined)
+  assert.equal(scopeCwd(undefined), undefined)
+  assert.equal(scopeCwd({ session: { header: { cwd: '' } } }), undefined)
+  const evil = {}
+  Object.defineProperty(evil, 'session', { get() { throw new Error('boom') } })
+  assert.equal(scopeCwd(evil), undefined, 'getter 抛错绝不扩散到 assemble 关键路径')
+})
+
+test('parseMemoryConclusion scope（§13）：project/global 保留，畸形抹字段，user 恒全局', () => {
+  const proj = parseConclusion('{"action":"nothing","memory":{"action":"add","store":"memory","scope":"project","text":"port is 19080"}}')
+  assert.equal(proj.memory.scope, 'project')
+  const glob = parseConclusion('{"action":"nothing","memory":{"action":"add","store":"memory","scope":"global","text":"x"}}')
+  assert.equal(glob.memory.scope, 'global')
+  // 缺席 → 无 scope 键（缺省全局，v0.5 行为不变）
+  const absent = parseConclusion('{"action":"nothing","memory":{"action":"add","store":"memory","text":"x"}}')
+  assert.ok(!('scope' in absent.memory))
+  // 畸形 scope 只抹字段不丢结论
+  const bad = parseConclusion('{"action":"nothing","memory":{"action":"add","store":"memory","scope":"galaxy","text":"x"}}')
+  assert.ok(bad.memory && !('scope' in bad.memory), 'invalid scope is dropped, the conclusion survives')
+  // store=user 恒全局：scope 抹除
+  const user = parseConclusion('{"action":"nothing","memory":{"action":"add","store":"user","scope":"project","text":"x"}}')
+  assert.ok(!('scope' in user.memory))
+})
+
+test('serializeMemoryEntries 带 header：cwd 注释插在标题与条目之间；两参输出不变', () => {
+  assert.equal(serializeMemoryEntries('memory', ['a'], '<!-- cwd: /x -->'), '# MEMORY\n<!-- cwd: /x -->\n\n§ a\n')
+  assert.equal(serializeMemoryEntries('memory', [], '<!-- cwd: /x -->'), '# MEMORY\n<!-- cwd: /x -->\n\n')
+  assert.equal(serializeMemoryEntries('memory', ['a']), '# MEMORY\n\n§ a\n')
+  assert.equal(serializeMemoryEntries('memory', ['a'], ''), '# MEMORY\n\n§ a\n', 'empty header is no header')
+  // header 行被 § 解析忽略——round-trip 不丢条目
+  assert.deepEqual(parseMemoryEntries(serializeMemoryEntries('memory', ['a'], '<!-- cwd: /x -->')), ['a'])
+})
+
+test('renderMemoryContext 工作区层（§13）：第四参驱动；全局空而工作区有条目也渲染', () => {
+  const eff = { memoryEnabled: true, userProfileEnabled: true, memoryCharLimit: 2200, userCharLimit: 1375 }
+  const readRaw = (store) => (store === 'memory' ? '§ global fact' : '')
+  const ws = { label: '/Users/mac/proj', raw: '§ workspace fact\n§ another ws fact' }
+  const out = renderMemoryContext(eff, readRaw, 'zh', ws)
+  assert.match(out, /## MEMORY（环境\/项目事实\/约定\/教训） — 11\/2200 字符 · 1 条\n§ global fact/)
+  // 字符数 = 条目正文合计（'workspace fact' 14 + 'another ws fact' 15）
+  assert.match(out, /## MEMORY · 工作区（\/Users\/mac\/proj） — 29\/2200 字符 · 2 条\n§ workspace fact\n§ another ws fact/)
+  // 顺序：全局 memory → 工作区 memory → user
+  assert.ok(out.indexOf('§ global fact') < out.indexOf('§ workspace fact'))
+  // en 分支
+  const en = renderMemoryContext(eff, readRaw, 'en', ws)
+  assert.match(en, /## MEMORY · workspace \(\/Users\/mac\/proj\) — 29\/2200 chars · 2 entries/)
+  // 全局空 + 工作区有条目 → 工作区小节照常出现
+  const onlyWs = renderMemoryContext(eff, () => '', 'zh', ws)
+  assert.match(onlyWs, /MEMORY · 工作区/)
+  // 工作区空 → 整节不出现（与空库不出现同款纪律）
+  const emptyWs = renderMemoryContext(eff, readRaw, 'zh', { label: '/x', raw: '' })
+  assert.doesNotMatch(emptyWs, /工作区/)
+  // 第四参缺席 → 与 v0.5 逐字一致（parity 断言在 i18n.test.mjs 钉住，这里自查一遍）
+  assert.equal(renderMemoryContext(eff, readRaw, 'zh'), renderMemoryContext(eff, readRaw, 'zh', undefined))
+})
+
+test('renderReviewMemoryBlock 工作区变体：标题换 MEMORY（工作区），默认形态逐字不变', () => {
+  const block = renderReviewMemoryBlock([
+    { store: 'memory', entries: ['global fact'] },
+    { store: 'memory', entries: ['ws fact'], variant: 'workspace' },
+    { store: 'user', entries: [] },
+  ], 'zh')
+  assert.match(block, /### MEMORY（1 条）\n§ global fact/)
+  assert.match(block, /### MEMORY（工作区）（1 条）\n§ ws fact/)
+  const en = renderReviewMemoryBlock([{ store: 'memory', entries: ['a'], variant: 'workspace' }], 'en')
+  assert.match(en, /### MEMORY \(workspace\) \(1 entry\)/)
+  // variant 只对 memory 库有意义：user 库带 variant 不换标题
+  const userVariant = renderReviewMemoryBlock([{ store: 'user', entries: ['a'], variant: 'workspace' }], 'zh')
+  assert.match(userVariant, /### USER（1 条）/)
+})
+
+test('reviewPrompt scope 门控（§13）：显式 true 才出现 scope 行；缺席/false/记忆关 都不出现', () => {
+  const on = plugin.__internals.reviewPrompt({ memoryEnabled: true, workspaceMemoryEnabled: true })
+  assert.ok(on.includes('"scope": "project" | "global"'), 'zh prompt carries the scope protocol line')
+  assert.ok(on.includes('MEMORY（工作区）'), 'zh prompt explains the workspace layer')
+  const off = plugin.__internals.reviewPrompt({ memoryEnabled: true })
+  assert.ok(!off.includes('"scope"'), 'undefined flag → no scope lines (upstream parity)')
+  const off2 = plugin.__internals.reviewPrompt({ memoryEnabled: true, workspaceMemoryEnabled: false })
+  assert.ok(!off2.includes('"scope"'), 'explicit false → no scope lines')
+  const memoryOff = plugin.__internals.reviewPrompt({ memoryEnabled: false, userProfileEnabled: false, workspaceMemoryEnabled: true })
+  assert.ok(!memoryOff.includes('"scope"'), 'memory channel off → scope lines off even when workspace flag on')
+  const en = plugin.__internals.reviewPrompt({ memoryEnabled: true, workspaceMemoryEnabled: true }, 'en')
+  assert.ok(en.includes('"scope": "project" | "global"'))
+  assert.ok(en.includes('MEMORY (workspace)'))
+  assert.ok(!/[\u3000-\u303f\uff00-\uffef\u4e00-\u9fff]/.test(en), 'en prompt with scope lines stays CJK-free')
+})
+
+test('memory e2e: scope:project 写入工作区库（带 cwd 头注释），全局库不动，复盘 prompt 带工作区块', async () => {
+  const cwd = '/tmp/fake-workspace-proj'
+  const conclusion = JSON.stringify({
+    action: 'nothing',
+    memory: { action: 'add', store: 'memory', scope: 'project', text: 'web runs on 19080', rationale: '项目端口' },
+  })
+  const { home, oldHome, notices, followup } = await runE2E({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, conclusion, { cwd })
+  try {
+    const wsFile = join(home, 'memory', 'workspaces', workspaceSlug(cwd), 'MEMORY.md')
+    const raw = await readFile(wsFile, 'utf8')
+    assert.match(raw, /§ web runs on 19080/)
+    assert.match(raw, /<!-- cwd: \/tmp\/fake-workspace-proj -->/, 'workspace file carries the cwd header')
+    // 全局库不受影响
+    let globalAbsent = false
+    try { await readFile(join(home, 'memory', 'MEMORY.md'), 'utf8') } catch { globalAbsent = true }
+    assert.ok(globalAbsent, 'project-scoped conclusion must not touch the global store')
+    // 回显标明工作区层
+    assert.ok(notices.some((n) => n.source && n.source.summary && n.source.summary.includes('MEMORY·工作区')),
+      notices.map((n) => n.source && n.source.summary).join('|'))
+    // 复盘 prompt：工作区块（空库也注入）+ scope 协议行（直接读消息正文，
+    // 不走 JSON.stringify——转义会改写引号）
+    const promptText = followup.content[0].text
+    assert.ok(promptText.includes('MEMORY（工作区）'), 'review prompt carries the workspace block label')
+    assert.ok(promptText.includes('"scope": "project" | "global"'), 'review prompt carries the scope protocol line')
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('memory e2e: scope:project 在 cwd 缺席或开关关闭时回退全局库（fail-open 保数据）', async () => {
+  const conclusion = JSON.stringify({
+    action: 'nothing',
+    memory: { action: 'add', store: 'memory', scope: 'project', text: 'fallback fact' },
+  })
+  // cwd 缺席（header {}）→ 全局库
+  {
+    const { home, oldHome } = await runE2E({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, conclusion)
+    try {
+      assert.match(await readFile(join(home, 'memory', 'MEMORY.md'), 'utf8'), /§ fallback fact/)
+      let wsAbsent = false
+      try { await readdir(join(home, 'memory', 'workspaces')) } catch { wsAbsent = true }
+      assert.ok(wsAbsent, 'no workspace dir may be created without cwd')
+    } finally {
+      if (oldHome === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = oldHome
+      await rm(home, { recursive: true, force: true })
+    }
+  }
+  // 开关关闭 → 全局库
+  {
+    const { home, oldHome } = await runE2E({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto', workspaceMemoryEnabled: false }, conclusion, { cwd: '/tmp/fake-ws-off' })
+    try {
+      assert.match(await readFile(join(home, 'memory', 'MEMORY.md'), 'utf8'), /§ fallback fact/)
+      let wsAbsent = false
+      try { await readdir(join(home, 'memory', 'workspaces')) } catch { wsAbsent = true }
+      assert.ok(wsAbsent, 'workspaceMemoryEnabled=false routes project conclusions to the global store')
+    } finally {
+      if (oldHome === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = oldHome
+      await rm(home, { recursive: true, force: true })
+    }
+  }
+})
+
+test('memory e2e: approval 模式暂存 scope:project 结论时 memoryDir 记工作区目录并带 cwd', async () => {
+  const cwd = '/tmp/fake-approval-ws'
+  const conclusion = JSON.stringify({
+    action: 'nothing',
+    memory: { action: 'add', store: 'memory', scope: 'project', text: 'pending ws fact' },
+  })
+  const { home, oldHome } = await runE2E({ turnInterval: 1, cooldownMinutes: 0, mode: 'approval' }, conclusion, { cwd })
+  try {
+    const staged = await readdir(join(home, 'hermes-loop', 'pending'))
+    assert.equal(staged.length, 1)
+    const payload = JSON.parse(await readFile(join(home, 'hermes-loop', 'pending', staged[0]), 'utf8'))
+    assert.equal(payload.memoryDir, join(home, 'memory', 'workspaces', workspaceSlug(cwd)))
+    assert.equal(payload.cwd, cwd)
+    assert.equal(payload.conclusion.memory.scope, 'project')
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('memory context 工作区层注入（§13）：会话首冻结按 cwd 拼接两层；无 cwd/开关关则无工作区层', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-wsctx-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const contexts = []
+    const services = fakeServices('```json\n{"action":"nothing"}\n```')
+    services.systemPrompt = { section: () => {}, context: (c) => contexts.push(c) }
+    setupPlugin({ turnInterval: 999 }, services)
+    const memCtx = contexts.find((c) => c.name === 'hermes:memory')
+    const cwd = '/tmp/proj-alpha'
+    await mkdir(join(home, 'memory', 'workspaces', workspaceSlug(cwd)), { recursive: true })
+    await writeFile(join(home, 'memory', 'MEMORY.md'), '# MEMORY\n\n§ global fact\n')
+    await writeFile(join(home, 'memory', 'workspaces', workspaceSlug(cwd), 'MEMORY.md'),
+      `# MEMORY\n${workspaceCwdHeader(cwd)}\n\n§ alpha-specific fact\n`)
+    const scopeA = { session: { header: { cwd } } }
+    const snap = memCtx.text({ scope: scopeA })
+    assert.match(snap, /§ global fact/)
+    assert.match(snap, /MEMORY · 工作区（\/tmp\/proj-alpha）/)
+    assert.match(snap, /§ alpha-specific fact/)
+    // 冻结：中途改工作区文件对当前会话不可见
+    await writeFile(join(home, 'memory', 'workspaces', workspaceSlug(cwd), 'MEMORY.md'), '# MEMORY\n\n§ mid-session ws fact\n')
+    assert.doesNotMatch(memCtx.text({ scope: scopeA }), /mid-session ws fact/)
+    // 另一个 cwd 的会话：看到自己的工作区层，看不到 alpha 的
+    const cwdB = '/tmp/proj-beta'
+    const snapB = memCtx.text({ scope: { session: { header: { cwd: cwdB } } } })
+    assert.match(snapB, /§ global fact/)
+    assert.doesNotMatch(snapB, /alpha-specific fact/)
+    // 无 cwd 的会话：纯全局层
+    const snapNone = memCtx.text({ scope: { session: { header: {} } } })
+    assert.match(snapNone, /§ global fact/)
+    assert.doesNotMatch(snapNone, /工作区/)
+    // 工作区库读盘故障（EISDIR）：该层按空渲染，全局层不受影响，绝不抛
+    await rm(join(home, 'memory', 'workspaces', workspaceSlug(cwd), 'MEMORY.md'))
+    await mkdir(join(home, 'memory', 'workspaces', workspaceSlug(cwd), 'MEMORY.md'))
+    const snapBroken = memCtx.text({ scope: { session: { header: { cwd } } } })
+    assert.match(snapBroken, /§ global fact/)
+    assert.doesNotMatch(snapBroken, /工作区（/)
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('memory context 工作区层：workspaceMemoryEnabled=false 时不读工作区库', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-wsoff-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const cwd = '/tmp/proj-off'
+    await mkdir(join(home, 'memory', 'workspaces', workspaceSlug(cwd)), { recursive: true })
+    await writeFile(join(home, 'memory', 'workspaces', workspaceSlug(cwd), 'MEMORY.md'), '# MEMORY\n\n§ off fact\n')
+    const contexts = []
+    const services = fakeServices('```json\n{"action":"nothing"}\n```')
+    services.systemPrompt = { section: () => {}, context: (c) => contexts.push(c) }
+    setupPlugin({ turnInterval: 999, workspaceMemoryEnabled: false }, services)
+    const memCtx = contexts.find((c) => c.name === 'hermes:memory')
+    const snap = memCtx.text({ scope: { session: { header: { cwd } } } })
+    assert.doesNotMatch(snap, /off fact/)
+    assert.doesNotMatch(snap, /工作区/)
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('GET status 聚合工作区库：slug/cwd/chars/entries/items 齐备', async () => {
+  const cwd = '/tmp/fake-status-ws'
+  const conclusion = JSON.stringify({
+    action: 'nothing',
+    memory: { action: 'add', store: 'memory', scope: 'project', text: 'status ws fact' },
+  })
+  const { home, oldHome, t } = await runE2E({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, conclusion, { cwd })
+  try {
+    const route = t.routes[0]
+    const res = fakeRes()
+    await route.handler({ method: 'GET', url: '/hermes-loop/api/status' }, res)
+    const body = JSON.parse(res.body)
+    assert.ok(Array.isArray(body.memory.workspaces), 'status carries the workspaces array')
+    assert.equal(body.memory.workspaces.length, 1)
+    const ws = body.memory.workspaces[0]
+    assert.equal(ws.slug, workspaceSlug(cwd))
+    assert.equal(ws.cwd, cwd, 'cwd read back from the file header comment')
+    assert.equal(ws.chars, 'status ws fact'.length)
+    assert.equal(ws.limit, 2200)
+    assert.equal(ws.entries, 1)
+    assert.deepEqual(ws.items, ['status ws fact'])
+    assert.equal(ws.enabled, true)
+    // 全局库不受影响，仍是 0 条
+    assert.equal(body.memory.stores.memory.entries, 0)
   } finally {
     if (oldHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = oldHome

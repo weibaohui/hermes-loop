@@ -406,6 +406,10 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     heading: '# Long-term memory (persists across sessions, maintained on demand by the background review; this is the latest full snapshot)',
     userTitle: 'USER (user profile / preferences)',
     memoryTitle: 'MEMORY (environment facts, project facts, conventions, lessons)',
+    // §13 (v0.6): the workspace-layer title joins the dictionary. Default-input
+    // renders never emit it (the fourth renderMemoryContext argument stays
+    // undefined), so upstream parity above is unaffected.
+    workspaceTitle: 'MEMORY · workspace ({label})',
     chars: 'chars',
     item: 'entry',
     items: 'entries',
@@ -417,6 +421,9 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     open: ' (',
     close: ')',
     empty: '(empty)',
+    // §13 (v0.6): workspace-layer block title, used only for stores carrying
+    // variant: 'workspace'; default renders are byte-identical to upstream.
+    workspace: 'MEMORY (workspace)',
   }, 'the English review memory block copy changed')
   assert.deepEqual(I.REVIEW_INPUT_TEXT.en, {
     catalog: 'Existing skill catalog (name: description)',
@@ -837,4 +844,64 @@ test('the memory block drops its section when both stores are off, in both langu
   assert.ok(!I.reviewPrompt(off, 'en').includes('"memory"'))
   assert.ok(!I.reviewPrompt(off, 'zh').includes('"memory"'))
   assert.match(I.reviewPrompt(off, 'en'), /not distilled this round/)
+})
+// ── §13 (v0.6) workspace memory copy ──────────────────────────────────────
+// The gated copy only appears when workspaceMemoryEnabled is explicitly true,
+// so the upstream-parity assertions above (whose inputs never carry the flag)
+// keep pinning the v0.5 text byte-for-byte. This block pins the new copy.
+
+test('workspace scope lines: zh/en mirror each other, gated on workspaceMemoryEnabled', () => {
+  const on = { memoryEnabled: true, userProfileEnabled: true, workspaceMemoryEnabled: true }
+  const zh = I.reviewPrompt(on, 'zh')
+  const en = I.reviewPrompt(on, 'en')
+
+  // Both languages carry the scope bullet and the protocol example line.
+  assert.ok(zh.includes('"scope": "project" | "global"'), 'zh protocol example carries scope')
+  assert.ok(en.includes('"scope": "project" | "global"'), 'en protocol example carries scope')
+  assert.ok(zh.includes('MEMORY（工作区）'), 'zh names the workspace block')
+  assert.ok(en.includes('MEMORY (workspace)'), 'en names the workspace block')
+  assert.ok(zh.includes('写入当前工作区库'), 'zh explains project routing')
+  assert.ok(en.includes('written to the current workspace store'), 'en explains project routing')
+
+  // The example line sits inside the memory conclusion example, right after store.
+  // (Find the protocol-example line specifically — the Memory section bullet
+  // mentions "scope" too, and it appears earlier in the prompt.)
+  const scopeLine = (l) => l.includes('"scope": "project" | "global",')
+  const zhLines = zh.split('\n')
+  const enLines = en.split('\n')
+  assert.ok(zhLines[zhLines.indexOf(zhLines.find(scopeLine)) - 1].trimStart().startsWith('"store"'), 'zh scope line follows the store line')
+  assert.ok(enLines[enLines.indexOf(enLines.find(scopeLine)) - 1].trimStart().startsWith('"store"'), 'en scope line follows the store line')
+
+  // Gated off → byte-identical base text (the parity loop above covers this via
+  // flag-less inputs; here the flag is explicit).
+  const off = { memoryEnabled: true, userProfileEnabled: true, workspaceMemoryEnabled: false }
+  assert.ok(!I.reviewPrompt(off, 'zh').includes('"scope"'))
+  assert.ok(!I.reviewPrompt(off, 'en').includes('"scope"'))
+
+  // The gated en copy must not leak CJK or fullwidth punctuation.
+  const cjk = /[\u3000-\u303f\uff00-\uffef\u4e00-\u9fff]/
+  assert.ok(!cjk.test(en), `en prompt with scope lines contains CJK: ${JSON.stringify(en.match(cjk))}`)
+})
+
+test('workspace layer renders in the snapshot and the review block, in both languages', () => {
+  const eff = { memoryEnabled: true, userProfileEnabled: true, memoryCharLimit: 2200, userCharLimit: 1375 }
+  const ws = { label: '/Users/mac/proj', raw: '§ workspace fact' }
+  const readRaw = (store) => (store === 'memory' ? '§ global fact' : '')
+
+  const zhSnap = I.renderMemoryContext(eff, readRaw, 'zh', ws)
+  const enSnap = I.renderMemoryContext(eff, readRaw, 'en', ws)
+  assert.ok(zhSnap.includes(I.MEMORY_CONTEXT_TEXT.zh.workspaceTitle.replace('{label}', '/Users/mac/proj')))
+  assert.ok(enSnap.includes(I.MEMORY_CONTEXT_TEXT.en.workspaceTitle.replace('{label}', '/Users/mac/proj')))
+  // zh/en dictionary values differ only in framing; entry text passes through.
+  assert.ok(zhSnap.includes('§ workspace fact') && enSnap.includes('§ workspace fact'))
+
+  const zhBlock = I.renderReviewMemoryBlock([{ store: 'memory', entries: ['a'], variant: 'workspace' }], 'zh')
+  const enBlock = I.renderReviewMemoryBlock([{ store: 'memory', entries: ['a'], variant: 'workspace' }], 'en')
+  assert.ok(zhBlock.includes(`### ${I.REVIEW_MEMORY_BLOCK_TEXT.zh.workspace}（1 条）`))
+  assert.ok(enBlock.includes(`### ${I.REVIEW_MEMORY_BLOCK_TEXT.en.workspace} (1 entry)`))
+
+  // The en surfaces stay CJK-free with the workspace copy active.
+  const cjk = /[\u3000-\u303f\uff00-\uffef\u4e00-\u9fff]/
+  assert.ok(!cjk.test(enSnap), 'en workspace snapshot contains CJK')
+  assert.ok(!cjk.test(enBlock), 'en workspace block contains CJK')
 })

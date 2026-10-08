@@ -219,6 +219,8 @@ const DEFAULTS = {
   userProfileEnabled: true,   // USER.md：画像/偏好；两开关全关 → 协议退回 skill 单结论
   memoryCharLimit: 2200,      // 对齐 Hermes 原版（≈800 tok）
   userCharLimit: 1375,        // ≈500 tok
+  // ── 工作区记忆（design §13，v0.6）：项目事实沉到 per-cwd 库，全局库只留跨项目约定 ──
+  workspaceMemoryEnabled: true,
 }
 
 // 0.1.7 settings 服务：字段标 .volatile() 才能被设置 UI 投影、才能经
@@ -249,6 +251,7 @@ function settingsSchema(S) {
     userProfileEnabled: S.boolean().default(true).volatile(),
     memoryCharLimit: S.number().min(200).default(2200).volatile(),
     userCharLimit: S.number().min(200).default(1375).volatile(),
+    workspaceMemoryEnabled: S.boolean().default(true).volatile(),
   })
 }
 // 0.1.7 loader 通过 entry.fiber.runtime.Config 自动发现 schema，必须在模块顶层导出。
@@ -268,6 +271,40 @@ function pendingDir() {
 }
 function memoryDir() {
   return join(dshHome(), 'memory')
+}
+
+// ── 工作区记忆（design §13，v0.6）─────────────────────────────────────────
+// 往 ~/.dsh 下写、仅用 cwd 给目录命名——不推导项目根（2026-08-29 评审否决的是
+// 往项目目录里写，cwd 向上找 .git 不稳定；这里 cwd 字符串本身就是权威输入，
+// 宿主在会话创建时校验必须为绝对路径）。slug 参考 Claude Code：路径分隔符与
+// 盘符冒号逐字折成 '-'，如 /Users/mac/proj → -Users-mac-proj。
+const WORKSPACE_SLUG_MAX = 128
+function workspaceSlug(cwd) {
+  if (typeof cwd !== 'string' || cwd.trim() === '') return undefined
+  const slug = cwd.replace(/[/\\:]/g, '-')
+  if (slug.length <= WORKSPACE_SLUG_MAX) return slug
+  // 超长路径截断并接哈希防碰撞（sha256 定义在下方 helper 区，运行时已就位）
+  return slug.slice(0, WORKSPACE_SLUG_MAX - 9) + '-' + sha256(cwd).slice(0, 8)
+}
+function workspaceMemoryDir(cwd) {
+  const slug = workspaceSlug(cwd)
+  return slug === undefined ? undefined : join(memoryDir(), 'workspaces', slug)
+}
+// slug 不可逆（路径里的 '-' 与分隔符都折成 '-'），工作区文件标题下写一行
+// cwd 注释自描述——§ 解析天然忽略它，面板与人工编辑都能读到真实路径。
+const workspaceCwdHeader = (cwd) => `<!-- cwd: ${cwd} -->`
+function workspaceCwdOf(raw) {
+  const m = String(raw || '').match(/^<!-- cwd: (.+) -->$/m)
+  return m === null ? undefined : m[1].trim()
+}
+
+// scope 即 agent 对象（dsh-agent dispatch assembleContextFor 返回 { agent, scope: agent }），
+// agent.session 是公开字段；任何一环缺席/抛错都按无 cwd 处理（退回纯全局层）。
+function scopeCwd(scope) {
+  try {
+    const header = scope && scope.session && scope.session.header
+    return header && typeof header.cwd === 'string' && header.cwd !== '' ? header.cwd : undefined
+  } catch { return undefined }
 }
 
 // ── Pure helpers (unit-tested via __internals) ──────────────────────────
@@ -380,6 +417,10 @@ function parseMemoryConclusion(raw) {
   }
   const out = { action: raw.action, store: raw.store, oldText: raw.oldText, rationale: typeof raw.rationale === 'string' ? raw.rationale : '' }
   if (text !== undefined) out.text = text
+  // scope（§13，v0.6）：'project' 写工作区库，'global'/缺席写全局库（缺省全局，
+  // v0.5 旧结论行为不变）。畸形值只抹字段不丢结论；store='user' 恒全局，scope 抹除。
+  if (raw.scope === 'project' || raw.scope === 'global') out.scope = raw.scope
+  if (out.store === 'user') delete out.scope
   return out
 }
 
@@ -574,11 +615,14 @@ function parseMemoryEntries(raw) {
   return out
 }
 
-/** 序列化：标准标题 + `§ ` 行。条目内换行折叠成空格，保持一行一条。 */
-function serializeMemoryEntries(store, entries) {
+/** 序列化：标准标题 + `§ ` 行。条目内换行折叠成空格，保持一行一条。
+ *  可选 header 行（§13 工作区库的 cwd 自描述注释）插在标题与条目之间；
+ *  缺省时输出与 v0.5 逐字一致。 */
+function serializeMemoryEntries(store, entries, header) {
   const title = store === 'user' ? 'USER' : 'MEMORY'
+  const head = typeof header === 'string' && header !== '' ? `\n${header}` : ''
   const body = entries.map((e) => '§ ' + normalizeEntry(e)).join('\n')
-  return `# ${title}\n\n${body}${body === '' ? '' : '\n'}`
+  return `# ${title}${head}\n\n${body}${body === '' ? '' : '\n'}`
 }
 
 const memoryCharsOf = (entries) => entries.reduce((n, e) => n + e.length, 0)
@@ -648,7 +692,7 @@ function planMemoryChange(entries, mem, { limit }) {
  * 用户手改由"写入前重读"自愈。
  * @returns {result, store, chars?, entries?, limit?, reason?, detail?}
  */
-async function applyMemoryConclusion(mem, { dir = memoryDir(), limits = {}, enabled = {} } = {}) {
+async function applyMemoryConclusion(mem, { dir = memoryDir(), limits = {}, enabled = {}, header } = {}) {
   const store = mem.store
   if (enabled[store] === false) return { result: 'store-disabled', store }
   const file = join(dir, store === 'user' ? 'USER.md' : 'MEMORY.md')
@@ -657,7 +701,7 @@ async function applyMemoryConclusion(mem, { dir = memoryDir(), limits = {}, enab
   try { raw = await fsP.readFile(file, 'utf8') } catch { /* 新库：空文件起步 */ }
   const plan = planMemoryChange(parseMemoryEntries(raw), mem, { limit })
   if (!plan.ok) return { ...plan, store, limit }
-  await atomicWrite(file, serializeMemoryEntries(store, plan.entries))
+  await atomicWrite(file, serializeMemoryEntries(store, plan.entries, header))
   return { result: plan.result, store, chars: plan.chars, entries: plan.entries.length, limit }
 }
 
@@ -677,6 +721,8 @@ const MEMORY_CONTEXT_TEXT = {
     heading: '# 长期记忆（跨会话持久，后台复盘按需维护；以下为最新全量快照）',
     userTitle: 'USER（用户画像/偏好）',
     memoryTitle: 'MEMORY（环境/项目事实/约定/教训）',
+    // §13 工作区层标题：{label} 替换为 cwd——模型需要知道这批事实属于哪个项目
+    workspaceTitle: 'MEMORY · 工作区（{label}）',
     chars: '字符',
     item: '条',
     items: '条',
@@ -685,6 +731,8 @@ const MEMORY_CONTEXT_TEXT = {
     heading: '# Long-term memory (persists across sessions, maintained on demand by the background review; this is the latest full snapshot)',
     userTitle: 'USER (user profile / preferences)',
     memoryTitle: 'MEMORY (environment facts, project facts, conventions, lessons)',
+    // §13 workspace layer title: {label} is replaced with the cwd
+    workspaceTitle: 'MEMORY · workspace ({label})',
     chars: 'chars',
     item: 'entry',
     items: 'entries',
@@ -694,8 +742,8 @@ const MEMORY_CONTEXT_TEXT = {
 // 括号也是复述文案的一部分：上游把全角「（）」直接写在模板里，en 分支若沿用全角，
 // 就会在纯英文复盘输入里留下唯一的 CJK 字符。zh 保持上游全角不动。
 const REVIEW_MEMORY_BLOCK_TEXT = {
-  zh: { section: '当前记忆条目（oldText 必须唯一命中某条原文；没有值得记的就省略 memory 字段）', item: '条', items: '条', open: '（', close: '）', empty: '（空）' },
-  en: { section: 'Current memory entries (oldText must match exactly one entry\'s original text; omit the memory field entirely when nothing is worth recording)', item: 'entry', items: 'entries', open: ' (', close: ')', empty: '(empty)' },
+  zh: { section: '当前记忆条目（oldText 必须唯一命中某条原文；没有值得记的就省略 memory 字段）', item: '条', items: '条', open: '（', close: '）', empty: '（空）', workspace: 'MEMORY（工作区）' },
+  en: { section: 'Current memory entries (oldText must match exactly one entry\'s original text; omit the memory field entirely when nothing is worth recording)', item: 'entry', items: 'entries', open: ' (', close: ')', empty: '(empty)', workspace: 'MEMORY (workspace)' },
 }
 
 const LOOP_AWARE_TEXT = {
@@ -742,17 +790,31 @@ const REVIEW_INPUT_TEXT = {
  * lang 选字典（'zh' 保持历史原文，'en' 走英文表）。条目正文是用户/复盘自己写的，
  * 不翻译——只翻译本函数生成的框架文字。
  */
-function renderMemoryContext(eff, readRaw, lang) {
+function renderMemoryContext(eff, readRaw, lang, workspace) {
   const T = MEMORY_CONTEXT_TEXT[languageOf(lang)]
   const sections = []
   for (const store of MEMORY_STORES) {
     if (!memoryStoreEnabled(store, eff)) continue
     let entries = []
     try { entries = parseMemoryEntries(readRaw(store)) } catch { entries = [] }
-    if (entries.length === 0) continue
-    const chars = memoryCharsOf(entries)
-    const title = store === 'user' ? T.userTitle : T.memoryTitle
-    sections.push(`## ${title} — ${chars}/${memoryStoreLimit(store, eff)} ${T.chars} · ${countLabel(entries.length, T.item, T.items)}\n${entries.map((e) => '§ ' + e).join('\n')}`)
+    if (entries.length > 0) {
+      const chars = memoryCharsOf(entries)
+      const title = store === 'user' ? T.userTitle : T.memoryTitle
+      sections.push(`## ${title} — ${chars}/${memoryStoreLimit(store, eff)} ${T.chars} · ${countLabel(entries.length, T.item, T.items)}\n${entries.map((e) => '§ ' + e).join('\n')}`)
+    }
+    // 工作区层（§13）：紧跟全局 MEMORY 小节之后。第四参缺席时一节都不渲染，
+    // 输出与 v0.5 逐字一致（i18n parity 断言依赖这一点）；全局库空但工作区库
+    // 有条目时工作区小节照常出现（挂在 memory 分支上，memoryEnabled=false 时
+    // 两层一起关）。工作区层限额复用 memoryCharLimit（每库独立配额）。
+    if (store === 'memory' && workspace && typeof workspace === 'object') {
+      let wEntries = []
+      try { wEntries = parseMemoryEntries(workspace.raw) } catch { wEntries = [] }
+      if (wEntries.length > 0) {
+        const wChars = memoryCharsOf(wEntries)
+        const wTitle = T.workspaceTitle.replace('{label}', String(workspace.label || ''))
+        sections.push(`## ${wTitle} — ${wChars}/${memoryStoreLimit('memory', eff)} ${T.chars} · ${countLabel(wEntries.length, T.item, T.items)}\n${wEntries.map((e) => '§ ' + e).join('\n')}`)
+      }
+    }
   }
   if (sections.length === 0) return ''
   return [
@@ -797,6 +859,7 @@ function sanitizeSettingsPatch(patch) {
   if (typeof patch.userProfileEnabled === 'boolean') out.userProfileEnabled = patch.userProfileEnabled
   num('memoryCharLimit', 200)
   num('userCharLimit', 200)
+  if (typeof patch.workspaceMemoryEnabled === 'boolean') out.workspaceMemoryEnabled = patch.workspaceMemoryEnabled
   return out
 }
 
@@ -863,7 +926,7 @@ const REVIEW_LANGUAGE_DIRECTIVE = {
   en: 'Write every natural-language field (description, body, memory.text, rationale) in English. This follows the user\'s language setting and is independent of whatever language the transcript, skill catalog, or memory entries happen to use.',
 }
 const REVIEW_PROMPT_TEXT = {
-  zh: (memoryOn) => [
+  zh: (memoryOn, workspaceOn) => [
     '你是后台复盘 agent：分析一段刚结束的对话转写，判断其中有没有值得沉淀为 skill 的经验。',
     '',
     '## 主动倾向',
@@ -897,6 +960,9 @@ const REVIEW_PROMPT_TEXT = {
       '- 用户画像、偏好、对你行为方式的期望 → store="user"；',
       '- 环境/项目事实、约定、教训（如"发布必须 OTP""服务跑在 19080 端口"）→ store="memory"；',
       '- 流程、步骤、坑 → 仍归 skill，绝不写进记忆。',
+      ...(workspaceOn ? [
+        '- store="memory" 分两层：只适用当前项目的事实/约定（路径、端口、脚本、项目特有规矩）→ 结论加 "scope": "project"，写入当前工作区库（下方「MEMORY（工作区）」）；跨项目通用的环境事实/约定 → 省略 scope 或写 "global"，写入全局库。replace/remove 的 oldText 按同层库定位。',
+      ] : []),
       '按需产出：没有明确值得记的就省略 memory 字段，不为写而写——记忆库是小限额精编清单，平庸条目会挤掉真条目，而漏记几乎零成本。',
       '库接近上限时优先 replace（合并改写既有条目）或 remove（删过时条目），而不是 add。',
       '',
@@ -920,6 +986,9 @@ const REVIEW_PROMPT_TEXT = {
       '  "memory": {                            // 可选；多数复盘应省略整个字段',
       '    "action": "nothing" | "add" | "replace" | "remove",',
       '    "store": "memory" | "user",           // add/replace/remove 必填',
+      ...(workspaceOn ? [
+        '    "scope": "project" | "global",           // 可选；仅 store="memory" 有效，缺省 global',
+      ] : []),
       '    "text": "新条目，一句话（add/replace 必填）",',
       '    "oldText": "下方记忆条目里唯一命中一条的原文子串（replace/remove 必填）",',
       '    "rationale": "为什么记/改/删" }',
@@ -930,7 +999,7 @@ const REVIEW_PROMPT_TEXT = {
     'body 章节规范：When to Use / Prerequisites / Procedure / Pitfalls / Verification。',
     REVIEW_LANGUAGE_DIRECTIVE.zh,
   ],
-  en: (memoryOn) => [
+  en: (memoryOn, workspaceOn) => [
     'You are the background review agent: analyze a transcript of a just-finished conversation and decide whether it holds experience worth distilling into a skill.',
     '',
     '## Lean toward acting',
@@ -964,6 +1033,9 @@ const REVIEW_PROMPT_TEXT = {
       '- user profile, preferences, expectations about how you behave → store="user";',
       '- environment/project facts, conventions, lessons (e.g. "releases require OTP", "the service runs on port 19080") → store="memory";',
       '- processes, steps, pitfalls → these remain skills; never write them into memory.',
+      ...(workspaceOn ? [
+        '- store="memory" has two layers: facts/conventions that only apply to the current project (paths, ports, scripts, project-specific rules) → add "scope": "project" to the conclusion, written to the current workspace store (the "MEMORY (workspace)" block below); cross-project environment facts/conventions → omit scope (or use "global") for the global store. oldText of replace/remove is located within the same layer.',
+      ] : []),
       'Produce on demand: if nothing is clearly worth keeping, omit the memory field — do not write for the sake of writing. The memory stores are small, tightly-curated lists; mediocre entries crowd out real ones, while a missed entry costs almost nothing.',
       'When a store nears its limit, prefer replace (merge and rewrite an existing entry) or remove (drop a stale entry) over add.',
       '',
@@ -987,6 +1059,9 @@ const REVIEW_PROMPT_TEXT = {
       '  "memory": {                            // optional; most reviews should omit the whole field',
       '    "action": "nothing" | "add" | "replace" | "remove",',
       '    "store": "memory" | "user",           // required for add/replace/remove',
+      ...(workspaceOn ? [
+        '    "scope": "project" | "global",           // optional; store="memory" only, defaults to global',
+      ] : []),
       '    "text": "New entry, one sentence (required for add/replace)",',
       '    "oldText": "A substring of the original text that uniquely matches one entry in the memory list below (required for replace/remove)",',
       '    "rationale": "Why record / change / delete" }',
@@ -1004,7 +1079,10 @@ function reviewPrompt(eff = {}, lang) {
     const enabled = s === 'user' ? eff.userProfileEnabled : eff.memoryEnabled
     return enabled !== false
   })
-  return REVIEW_PROMPT_TEXT[languageOf(lang)](memoryOn).join('\n')
+  // §13 scope 行的门控：显式 true 才出现。undefined（如 parity 测试的 {} 输入）
+  // 视为关——上游逐字断言因此不动；运行时 eff 合并了 DEFAULTS（true），默认即开。
+  const workspaceOn = memoryOn && eff.workspaceMemoryEnabled === true
+  return REVIEW_PROMPT_TEXT[languageOf(lang)](memoryOn, workspaceOn).join('\n')
 }
 
 /**
@@ -1014,15 +1092,19 @@ function reviewPrompt(eff = {}, lang) {
  * template upstream writes inline, which is the only place the count's spacing
  * and full-width parentheses are pinned.
  *
- * @param {Array<{store: string, entries: string[]}>} stores Enabled stores in render order.
+ * @param {Array<{store: string, entries: string[], variant?: 'workspace'}>} stores Enabled stores in render order.
  * @param {string} [lang]
  * @returns {string} The block, or '' when no store is enabled.
  */
 function renderReviewMemoryBlock(stores, lang) {
   const MT = REVIEW_MEMORY_BLOCK_TEXT[languageOf(lang)]
   if (stores.length === 0) return ''
-  const storeParts = stores.map(({ store, entries }) =>
-    `### ${store === 'user' ? 'USER' : 'MEMORY'}${MT.open}${countLabel(entries.length, MT.item, MT.items)}${MT.close}\n${entries.length > 0 ? entries.map((e) => '§ ' + e).join('\n') : MT.empty}`)
+  // variant==='workspace'（§13）给工作区库小节换标题，其余逐字不变——scope:"project"
+  // 的结论就定位到这个库，标签必须让模型分得清两层
+  const storeParts = stores.map(({ store, entries, variant }) => {
+    const title = variant === 'workspace' && store === 'memory' ? MT.workspace : (store === 'user' ? 'USER' : 'MEMORY')
+    return `### ${title}${MT.open}${countLabel(entries.length, MT.item, MT.items)}${MT.close}\n${entries.length > 0 ? entries.map((e) => '§ ' + e).join('\n') : MT.empty}`
+  })
   return '\n## ' + MT.section + '\n' + storeParts.join('\n\n')
 }
 
@@ -1059,6 +1141,7 @@ module.exports = {
     memoryDir, memoryStoreFile, memoryStoreEnabled, memoryStoreLimit, normalizeEntry,
     parseMemoryEntries, serializeMemoryEntries, scanMemoryEntry, planMemoryChange,
     applyMemoryConclusion, renderMemoryContext, renderReviewMemoryBlock,
+    workspaceSlug, workspaceMemoryDir, workspaceCwdHeader, workspaceCwdOf, scopeCwd,
     // Locale surface, exported for the parity tests.
     reviewPrompt, readLocalePreference, languageOf, LOCALE_SETTINGS_NS, DEFAULT_LANGUAGE,
     LANGUAGE_RETRIES, createLanguageResolver, countLabel,
@@ -1174,11 +1257,23 @@ module.exports = {
     if (ctx.systemPrompt && typeof ctx.systemPrompt.context === 'function') {
       const memoryFreeze = new WeakMap() // scope(agent) → 会话首快照文本（可为 ''）
       const memoryWarn = { at: 0 }
-      const renderMemorySafe = (lang) => {
+      const renderMemorySafe = (lang, cwd) => {
         try {
-          return renderMemoryContext(effective(), (store) => {
+          const eff = effective()
+          // 工作区层（§13）：开关开 + cwd 已知 + memory 库开，才读 workspaces/<slug>/MEMORY.md；
+          // 读盘故障按空库渲染（单层故障不扩散，与全局库同款容错）
+          let workspace
+          if (cwd !== undefined && eff.workspaceMemoryEnabled !== false && eff.memoryEnabled !== false) {
+            let raw = ''
+            try {
+              const dir = workspaceMemoryDir(cwd)
+              if (dir !== undefined) raw = fs.readFileSync(join(dir, 'MEMORY.md'), 'utf8')
+            } catch { raw = '' }
+            workspace = { label: cwd, raw }
+          }
+          return renderMemoryContext(eff, (store) => {
             try { return fs.readFileSync(memoryStoreFile(store), 'utf8') } catch { return '' }
-          }, lang)
+          }, lang, workspace)
         } catch (e) {
           // 读盘/渲染故障：本会话以空快照起步（宁可空不可错），限频告警防刷日志
           const nowMs = Date.now()
@@ -1198,14 +1293,16 @@ module.exports = {
             if (memoryFreeze.has(scope)) return memoryFreeze.get(scope)
             const lang = language()
             memoryLang.set(scope, lang)
-            const text = renderMemorySafe(lang)
+            // §13：cwd 在冻结这一刻取定（scope 即 agent，session.header.cwd 是会话
+            // 创建时的元数据）——冻结语义不变，只是快照内容多了工作区层
+            const text = renderMemorySafe(lang, scopeCwd(scope))
             memoryFreeze.set(scope, text)
             return text
           }
-          return renderMemorySafe(language()) // 无 scope（非常规调用/测试）：现算，不冻结
+          return renderMemorySafe(language()) // 无 scope（非常规调用/测试）：现算，不冻结；无 cwd 也就没有工作区层
         },
       }), 'hermes-loop: memory context')
-      ctx.logger.info && ctx.logger.info('hermes-loop: memory context registered (~/.dsh/memory/{MEMORY,USER}.md, frozen per session)')
+      ctx.logger.info && ctx.logger.info('hermes-loop: memory context registered (~/.dsh/memory/{MEMORY,USER}.md + workspaces/<slug>/MEMORY.md, frozen per session)')
     }
 
     // ── Trigger state ──
@@ -1511,6 +1608,16 @@ module.exports = {
             let raw = ''
             try { raw = await fsP.readFile(memoryStoreFile(store), 'utf8') } catch { /* 新库 */ }
             stores.push({ store, entries: parseMemoryEntries(raw) })
+            // 工作区层（§13）：紧跟全局 MEMORY 块之后，空库也注入（让模型知道这层存在，
+            // scope:"project" 的结论才有落点）；cwd 缺席/非法或开关关闭时不出现
+            if (store === 'memory' && eff.workspaceMemoryEnabled !== false) {
+              const dir = workspaceMemoryDir(cwd)
+              if (dir !== undefined) {
+                let wRaw = ''
+                try { wRaw = await fsP.readFile(join(dir, 'MEMORY.md'), 'utf8') } catch { /* 新库 */ }
+                stores.push({ store: 'memory', entries: parseMemoryEntries(wRaw), variant: 'workspace' })
+              }
+            }
           }
           memoryBlock = renderReviewMemoryBlock(stores, lang)
         }
@@ -1630,9 +1737,16 @@ module.exports = {
       const logHead = hasSkill
         ? `hermes-loop: ${conclusion.action} '${conclusion.skill}' (from session ${sessionId})`
         : `hermes-loop: memory ${conclusion.memory.action}@${conclusion.memory.store} (from session ${sessionId})`
+      // §13 scope 路由：仅 store="memory" + scope="project" + 开关开 + cwd 已知时落工作区库；
+      // 其余（含开关关闭/cwd 缺席的 project 结论）回退全局库——fail-open 保数据，不丢结论
+      const sessionCwd = session && session.header && typeof session.header.cwd === 'string' ? session.header.cwd : undefined
+      const wsDir = hasMemory && conclusion.memory.store === 'memory' && conclusion.memory.scope === 'project' && eff.workspaceMemoryEnabled !== false
+        ? workspaceMemoryDir(sessionCwd)
+        : undefined
       trace('dispatch', {
         sessionId, mode: eff.mode, action: conclusion.action, skill: conclusion.skill,
         memory: hasMemory ? `${conclusion.memory.store}:${conclusion.memory.action}` : undefined,
+        memoryScope: hasMemory ? (wsDir !== undefined ? 'project' : 'global') : undefined,
       })
       if (eff.mode === 'log-only') {
         ctx.logger.info(`${logHead} — log-only mode, not written. ${JSON.stringify(hasSkill ? conclusion : conclusion.memory)}`)
@@ -1643,7 +1757,8 @@ module.exports = {
         // 纯记忆结论也有稳定的 pending 标识（skill 结论缺席时不留 undefined）
         const label = hasSkill ? conclusion.skill : `memory-${conclusion.memory.store}`
         const id = `${Date.now().toString(36)}-${label}`
-        const payload = { id, at: new Date().toISOString(), sourceSession: sessionId, mode: eff.mode, globalDir: globalSkillsDir(), memoryDir: memoryDir(), conclusion }
+        // memoryDir 记实际目标目录（工作区库或全局库），cwd 供人工审批时核对归属
+        const payload = { id, at: new Date().toISOString(), sourceSession: sessionId, mode: eff.mode, globalDir: globalSkillsDir(), memoryDir: wsDir || memoryDir(), cwd: sessionCwd, conclusion }
         await fsP.mkdir(dir, { recursive: true })
         await atomicWrite(join(dir, `${id}.json`), JSON.stringify(payload, null, 2))
         trace('staged', { id, dir, sessionId })
@@ -1670,17 +1785,20 @@ module.exports = {
       if (hasMemory) {
         const mem = conclusion.memory
         const outcome = await applyMemoryConclusion(mem, {
-          dir: memoryDir(),
+          dir: wsDir || memoryDir(),
           limits: { memory: eff.memoryCharLimit, user: eff.userCharLimit },
           enabled: { memory: eff.memoryEnabled !== false, user: eff.userProfileEnabled !== false },
+          // 工作区库文件带 cwd 头注释自描述（slug 不可逆）；全局库不写，保持 v0.5 格式
+          header: wsDir !== undefined && sessionCwd !== undefined ? workspaceCwdHeader(sessionCwd) : undefined,
         })
-        trace('memory-outcome', { sessionId, store: mem.store, action: mem.action, result: outcome.result, reason: outcome.reason, chars: outcome.chars, entries: outcome.entries })
+        trace('memory-outcome', { sessionId, store: mem.store, action: mem.action, scope: wsDir !== undefined ? 'project' : 'global', slug: wsDir !== undefined ? workspaceSlug(sessionCwd) : undefined, result: outcome.result, reason: outcome.reason, chars: outcome.chars, entries: outcome.entries })
         const memHead = `hermes-loop: memory ${mem.action}@${mem.store} (from session ${sessionId})`
+        const storeLabel = wsDir !== undefined ? 'MEMORY·工作区' : mem.store.toUpperCase()
         const verb = { added: '写入', replaced: '改写', removed: '移除' }[outcome.result]
         if (verb !== undefined) {
           ctx.logger.info(`${memHead} — ${outcome.result} (${outcome.chars}/${outcome.limit} chars, ${outcome.entries} entries)`)
           // 注入是会话首冻结（§12.2）：明示"下个会话生效"，不让用户以为当前会话立即可见
-          notifySourceSession(session, `后台复盘已${verb}记忆（${mem.store.toUpperCase()}，${outcome.chars}/${outcome.limit} 字符，下个会话生效）${mem.rationale ? `：${mem.rationale}` : ''}`)
+          notifySourceSession(session, `后台复盘已${verb}记忆（${storeLabel}，${outcome.chars}/${outcome.limit} 字符，下个会话生效）${mem.rationale ? `：${mem.rationale}` : ''}`)
         } else if (outcome.result === 'rejected') {
           ctx.logger.warn(`${memHead} — rejected: ${outcome.reason}. ${outcome.detail || ''}`)
         } else {
@@ -2002,6 +2120,31 @@ module.exports = {
       memory.lastOutcome = lastMemoryOutcome
         ? { at: lastMemoryOutcome.at, store: lastMemoryOutcome.store, action: lastMemoryOutcome.action, result: lastMemoryOutcome.result, reason: lastMemoryOutcome.reason }
         : undefined
+      // 工作区库聚合（§13.4）：枚举 memory/workspaces/*，slug 不可逆所以 cwd 读文件头
+      // 注释；单库故障跳过该库不扩散。上限 50 个（正常使用远低于此，防御手工堆积）
+      memory.workspaces = []
+      try {
+        const wsRoot = join(memoryDir(), 'workspaces')
+        const dirs = (await fsP.readdir(wsRoot, { withFileTypes: true }))
+          .filter((d) => d.isDirectory())
+          .map((d) => d.name)
+          .sort()
+          .slice(0, 50)
+        for (const slug of dirs) {
+          let raw = ''
+          try { raw = await fsP.readFile(join(wsRoot, slug, 'MEMORY.md'), 'utf8') } catch { continue }
+          const entries = parseMemoryEntries(raw)
+          memory.workspaces.push({
+            slug,
+            cwd: workspaceCwdOf(raw),
+            enabled: eff.workspaceMemoryEnabled !== false && eff.memoryEnabled !== false,
+            chars: memoryCharsOf(entries),
+            limit: eff.memoryCharLimit,
+            entries: entries.length,
+            items: entries.slice(0, 40),
+          })
+        }
+      } catch { /* 尚无工作区库目录 */ }
       return {
         settings: eff,
         running: running !== null ? { sessionId: running.sessionId, startedAt: runningSince, preview: running.preview } : null,
