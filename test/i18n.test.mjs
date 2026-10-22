@@ -154,17 +154,23 @@ test('the default language is upstream 0.1.16, verified by running upstream', or
   }
   // §13 (v0.6) adds two more deliberate lines to the zh branch whenever the
   // memory channel is on: the two-layer routing bullet in the Memory section
-  // and the "scope" example line in the conclusion schema. Same discipline as
-  // the directive strip: pin the exact additions by pulling them out of the
-  // current zh array (so they exist and are singular), remove exactly those
-  // lines, and leave every other character under the upstream comparison.
+  // and the "scope" example line in the conclusion schema. issue #6 adds a
+  // third deliberate line (memory channel or not): the body-fence warning in
+  // the output protocol, because the parse-side rescue of issue #6 is a
+  // fallback, not a guarantee — the model should not produce truncated
+  // conclusions in the first place. Same discipline as the directive strip:
+  // pin the exact additions by pulling them out of the current zh array (so
+  // they exist and are singular), remove exactly those lines, and leave every
+  // other character under the upstream comparison.
   const zhNow = I.REVIEW_PROMPT_TEXT.zh(true)
   const scopeLineOf = (lines) => lines.filter((l) => l.includes('"scope": "project" | "global",'))
   const bulletLineOf = (lines) => lines.filter((l) => l.startsWith('- store="memory" 分两层'))
+  const fenceLineOf = (lines) => lines.filter((l) => l.startsWith('body 内如需代码块'))
   assert.equal(scopeLineOf(zhNow).length, 1, 'exactly one scope example line may exist in the zh prompt')
   assert.equal(bulletLineOf(zhNow).length, 1, 'exactly one two-layer bullet may exist in the zh prompt')
+  assert.equal(fenceLineOf(zhNow).length, 1, 'exactly one body-fence warning may exist in the zh prompt')
   const stripScopeLines = (text) =>
-    text.split('\n').filter((l) => !scopeLineOf([l]).length && !bulletLineOf([l]).length).join('\n')
+    text.split('\n').filter((l) => !scopeLineOf([l]).length && !bulletLineOf([l]).length && !fenceLineOf([l]).length).join('\n')
   for (const eff of [
     { memoryEnabled: true, userProfileEnabled: true },
     { memoryEnabled: true, userProfileEnabled: false },
@@ -535,11 +541,15 @@ test('the review prompt switches wholesale and keeps its contract', () => {
     '}',
     '```',
     'On patch, the body must be derived by modifying the injected target text (keep what is correct, change only what must change); never rewrite it from scratch.',
+    // issue #6: the parse-side fix rescues inner-fence truncation; this prompt line
+    // lowers the incidence by telling the model to fence body code blocks differently.
+    'If the body itself needs code blocks, fence them with four backticks or four tildes — never with the same triple-backtick fence as the conclusion, or the whole conclusion gets truncated.',
     'Body section convention: When to Use / Prerequisites / Procedure / Pitfalls / Verification.',
     I.REVIEW_LANGUAGE_DIRECTIVE.en,
   ], 'the English review prompt changed')
   const enOff = I.REVIEW_PROMPT_TEXT.en(false)
-  assert.equal(enOff.length, 44, 'the English memory-off prompt must drop exactly the two memory blocks')
+  // 44 + the issue #6 body-fence warning line, which ships regardless of memoryOn.
+  assert.equal(enOff.length, 45, 'the English memory-off prompt must drop exactly the two memory blocks')
   assert.ok(!enOff.some((l) => l.startsWith('## Memory')), 'no memory guidance section when memory is off')
   assert.ok(!enOff.some((l) => l.includes('"memory":')), 'no memory conclusion schema when memory is off')
   assert.deepEqual(

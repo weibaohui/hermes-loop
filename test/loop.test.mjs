@@ -89,6 +89,43 @@ test('parseConclusion fail-closes on junk: bad action, bad name, empty body, non
   assert.equal(parseConclusion('{"action":"nothing"}').action, 'nothing')
 })
 
+test('parseConclusion survives inner code fences in body (issue #6): lazy fence truncation no longer drops the conclusion', () => {
+  // skill body 带三反引号代码块 → 旧版懒匹配在第一个内层围栏处截断 JSON，
+  // JSON.parse 抛 Unterminated string → 整条结论被丢弃（action: 'unparseable'）
+  const body = '# T\n\n```bash\nnpm run build\n```\n\n## Procedure\ndo it'
+  const text = '```json\n' + JSON.stringify({ action: 'create', skill: 'a-b', description: 'd', body, rationale: 'r' }) + '\n```'
+  const c = parseConclusion(text)
+  assert.equal(c.action, 'create', 'conclusion with inner fences must survive')
+  assert.equal(c.body, body, 'body must round-trip verbatim, not stop at the first inner fence')
+})
+
+test('parseConclusion accepts body fenced with four backticks (prompt-side mitigation path)', () => {
+  const body = '# T\n\n````bash\nnpm run build\n````\n'
+  const text = '```json\n' + JSON.stringify({ action: 'create', skill: 'a-b', description: 'd', body, rationale: 'r' }) + '\n```'
+  const c = parseConclusion(text)
+  assert.equal(c.action, 'create')
+  assert.equal(c.body, body)
+})
+
+test('extractFencedJson fallback stays fail-closed when no candidate parses (issue #6 behavior pin)', () => {
+  // 围栏里是坏 JSON、别处没有大括号 → 全部候选解析失败 → 返回首个候选 → parseConclusion 照旧 undefined
+  assert.equal(parseConclusion('```json\n{broken\n```'), undefined)
+  // 前置说明 + 围栏坏 JSON + 后置无大括号文本 → 同样 fail-closed，不抛异常
+  assert.equal(parseConclusion('前置说明\n```json\n{"action": }\n```\n尾部说明'), undefined)
+})
+
+test('extractFencedJson brace-span candidate rescues fenced-but-broken output with valid braces after it', () => {
+  // 围栏候选坏（无大括号的碎片）但其后大括号区间完整 → 第三候选兜住
+  // （新旧行为分界：旧版围栏命中即返回 lazy[1]，这条直接 undefined）
+  const body = 'code:\n```\nx\n```'
+  const inner = JSON.stringify({ action: 'patch', skill: 'a-b', body, baseHash: 'h1' })
+  const text = '```json\noops\n```\n' + inner
+  const c = parseConclusion(text)
+  assert.equal(c.action, 'patch')
+  assert.equal(c.baseHash, 'h1')
+  assert.equal(c.body, body)
+})
+
 // ── buildSkillMd / descriptionOf ────────────────────────────────────────
 
 test('buildSkillMd emits valid frontmatter and descriptionOf round-trips it', () => {

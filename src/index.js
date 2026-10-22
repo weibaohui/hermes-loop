@@ -383,15 +383,29 @@ function rankSuspects(catalog, transcriptText) {
   return scored.map((s) => s.entry)
 }
 
-/** Pull the first fenced ```json block, else the outermost braces span. */
+/**
+ * Pull the fenced ```json block holding the conclusion, else the outermost
+ * braces span. Issue #6: the conclusion body legitimately contains code
+ * fences of its own (skill bodies almost always do), and a lazy fence match
+ * stops at the first inner fence — truncating the JSON mid-string. So collect
+ * candidates in order (lazy fence → greedy fence → brace span) and return the
+ * first one JSON.parse accepts; when none parses, fall back to the first
+ * candidate so parseConclusion's own failure path (log + drop) is unchanged.
+ */
 function extractFencedJson(text) {
   const raw = String(text || '')
-  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/)
-  if (fenced) return fenced[1]
+  const candidates = []
+  const lazy = raw.match(/```(?:json)?\s*([\s\S]*?)```/)
+  if (lazy) candidates.push(lazy[1])
+  const greedy = raw.match(/```(?:json)?\s*([\s\S]*)```/)
+  if (greedy && (!lazy || greedy[1] !== lazy[1])) candidates.push(greedy[1])
   const start = raw.indexOf('{')
   const end = raw.lastIndexOf('}')
-  if (start >= 0 && end > start) return raw.slice(start, end + 1)
-  return undefined
+  if (start >= 0 && end > start) candidates.push(raw.slice(start, end + 1))
+  for (const candidate of candidates) {
+    try { JSON.parse(candidate); return candidate } catch { /* try the next candidate */ }
+  }
+  return candidates.length > 0 ? candidates[0] : undefined
 }
 
 /**
@@ -1005,6 +1019,7 @@ const REVIEW_PROMPT_TEXT = {
     '}',
     '```',
     'patch 时 body 必须基于注入的目标全文修改（保留正确内容，只改需要改的），不得凭空重写。',
+    'body 内如需代码块，围栏一律用四个反引号或四个波浪线，绝不能用与结论相同的三反引号——内层三反引号会截断整条结论。',
     'body 章节规范：When to Use / Prerequisites / Procedure / Pitfalls / Verification。',
     REVIEW_LANGUAGE_DIRECTIVE.zh,
   ],
@@ -1074,6 +1089,7 @@ const REVIEW_PROMPT_TEXT = {
     '}',
     '```',
     'On patch, the body must be derived by modifying the injected target text (keep what is correct, change only what must change); never rewrite it from scratch.',
+    'If the body itself needs code blocks, fence them with four backticks or four tildes — never with the same triple-backtick fence as the conclusion, or the whole conclusion gets truncated.',
     'Body section convention: When to Use / Prerequisites / Procedure / Pitfalls / Verification.',
     REVIEW_LANGUAGE_DIRECTIVE.en,
   ],
