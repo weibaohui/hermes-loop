@@ -1608,14 +1608,26 @@ module.exports = {
 
         // 3. zero-tool review agent（进程内、独立会话、不污染会话库）
         const selection = ctx.agentDefaultModel.currentSelection()
+        // 不把父 signal 传给 agents.create（issue #7）：创建中途被父 signal abort，
+        // dsh 内部会留下一条未接管的 promise 链，unhandledRejection 直接把宿主进程
+        // 带崩（exit 1 / 安全模式）。改在创建完成后登记 cancel 监听；abort 若落在
+        // create 期间，下方 aborted 检查当场补一次 cancel，复盘安静让位。
         handle = await ctx.agents.create({
           sessionId: 'hermes-loop-review-' + randomUUID(),
           meta: { cwd, agentPreset: 'standard', origin: 'subagent' },
           agentOptions: { provider: eff.provider || selection.provider, model: eff.model || selection.model },
-          signal: controller.signal,
           setup: (agentCtx) => { agentCtx.tools.restrict({ allow: [] }) },
         })
         const agent = handle.agent
+        const onAbort = () => { try { agent.cancel({ kind: 'parent' }) } catch {} }
+        controller.signal.addEventListener('abort', onAbort, { once: true })
+        if (controller.signal.aborted) {
+          // abort 落在 create 期间（前台打断窗口就在这一两秒）：监听器已错过触发，
+          // 当场补 cancel，复盘安静让位
+          onAbort()
+          ctx.logger.warn(`hermes-loop: review for session ${sessionId} aborted (timeout=${eff.reviewTimeoutSec}s / foreground priority)`)
+          return
+        }
         trace('review-agent-created', { reviewSession: agent.id })
 
         // 3.5 当前记忆条目注入（§12.3）：replace/remove 的 oldText 定位与 add 去重都以它为基准
@@ -1677,8 +1689,6 @@ module.exports = {
         if (typeof timer.unref === 'function') timer.unref()
         const timeout = setTimeout(() => controller.abort(), Math.max(30, eff.reviewTimeoutSec) * 1000)
         if (typeof timeout.unref === 'function') timeout.unref()
-        const onAbort = () => { try { agent.cancel({ kind: 'parent' }) } catch {} }
-        controller.signal.addEventListener('abort', onAbort, { once: true })
         try {
           const IT = REVIEW_INPUT_TEXT[lang]
           const prompt = [
@@ -1744,10 +1754,15 @@ module.exports = {
     const notifySourceSession = (session, summary) => {
       if (!session || typeof session.append !== 'function') return
       try {
-        session.append('user/message', {
+        // append 是异步的（dsh Session.append 返回 promise）：会话句柄已关闭时
+        // reject 会走进程级 unhandledRejection——issue #7 的同款致命路径，必须挂住
+        const appended = session.append('user/message', {
           content: [{ type: 'text', text: summary }],
           source: { kind: 'plugin', plugin: 'hermes-loop', form: 'notice', summary },
         })
+        if (appended && typeof appended.catch === 'function') {
+          appended.catch((e) => ctx.logger.warn(`hermes-loop: source-session notice: ${e && e.message}`))
+        }
       } catch (e) { ctx.logger.warn(`hermes-loop: source-session notice: ${e && e.message}`) }
     }
 
