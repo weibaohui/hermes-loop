@@ -1918,3 +1918,79 @@ test('GET status 聚合工作区库：slug/cwd/chars/entries/items 齐备', asyn
     await rm(home, { recursive: true, force: true })
   }
 })
+
+// ── issue #7：turn/start abort 后台复盘漏出 unhandledRejection 带崩宿主进程 ──
+
+test('issue #7: agents.create 不再收父 signal；create 期间的 abort 当场 cancel 并安静退出', async () => {
+  const cancelled = []
+  const agent = {
+    session: { seq: 0, events: [] },
+    followup() {},
+    whenIdle: async () => {},
+    cancel(opts) { cancelled.push(opts) },
+  }
+  let releaseCreate
+  const createOpts = []
+  // 崩溃形态是进程级 unhandledRejection：挂 canary，跑完后断言零泄漏
+  const leaked = []
+  const onLeak = (reason) => leaked.push(reason)
+  process.on('unhandledRejection', onLeak)
+  try {
+    const services = {
+      agents: {
+        create: (opts) => {
+          createOpts.push(opts)
+          // 模拟创建耗时：resolve 把柄交回测试，复现"创建中途被打断"的窗口
+          return new Promise((resolve) => { releaseCreate = () => resolve({ agent, dispose: async () => {} }) })
+        },
+      },
+      agentDefaultModel: { currentSelection: () => ({ provider: 'prov', model: 'mdl' }) },
+    }
+    const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'log-only' }, services)
+    const session = { id: 'session-abort', header: {}, deriveMessages: () => [{ role: 'user', content: 'hi' }] }
+    t.fire(session, completedTurn) // 触发阈值 → 复盘启动，卡在 create
+    await new Promise((r) => setTimeout(r, 20))
+    assert.equal(createOpts.length, 1, 'review is pending inside agents.create')
+    assert.equal(createOpts[0].signal, undefined, 'create must not receive the parent signal (issue #7 leak)')
+    t.fire(session, { type: 'turn/start' }) // 用户下一条消息 → 前台优先 abort
+    releaseCreate() // create 此刻才返回（真实宿主里的时序）
+    await new Promise((r) => setTimeout(r, 20))
+    assert.deepEqual(cancelled, [{ kind: 'parent' }], 'abort during create must cancel the freshly created agent')
+    assert.ok(t.warns.some((m) => m.includes('review for session session-abort aborted')), t.warns.join('|'))
+    await new Promise((r) => setImmediate(r))
+    assert.equal(leaked.length, 0, `unexpected unhandledRejection: ${leaked.map(String).join('; ')}`)
+  } finally {
+    process.off('unhandledRejection', onLeak)
+  }
+})
+
+test('issue #7: notifySourceSession 挂住 session.append 的异步 rejection', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'hermes-loop-notice-e2e-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  const leaked = []
+  const onLeak = (reason) => leaked.push(reason)
+  process.on('unhandledRejection', onLeak)
+  try {
+    // 用 skill 结论：approval 分支的纯 nothing 结论会踩 conclusion.memory.store（另一回事，不掺和）
+    const conclusion = '```json\n' + JSON.stringify({ action: 'create', skill: 'notice-skill', description: 'd', body: 'b' }) + '\n```'
+    const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'approval' }, fakeServices(conclusion))
+    const session = {
+      id: 'session-notice',
+      header: {},
+      deriveMessages: () => [{ role: 'user', content: 'hi' }],
+      // 模拟会话句柄已关闭：同步不抛，promise 异步 reject（sync try/catch 接不住）
+      append: () => Promise.reject(new Error('session closed')),
+    }
+    t.fire(session, completedTurn)
+    await new Promise((r) => setTimeout(r, 90))
+    assert.ok(t.warns.some((m) => m.includes('source-session notice: session closed')), t.warns.join('|'))
+    await new Promise((r) => setImmediate(r))
+    assert.equal(leaked.length, 0, `unexpected unhandledRejection: ${leaked.map(String).join('; ')}`)
+  } finally {
+    process.off('unhandledRejection', onLeak)
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
