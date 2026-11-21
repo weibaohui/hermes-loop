@@ -3,11 +3,15 @@ import assert from 'node:assert/strict'
 import { mkdtemp, readFile, writeFile, mkdir, rm, readdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { createRequire } from 'node:module'
 
 // 测试全程把 DSH_HOME 指向临时目录：插件的 activity.jsonl 审计日志与全局
 // skill 目录都按 $DSH_HOME 解析，否则会污染真实 ~/.dsh。
 process.env.DSH_HOME = await mkdtemp(join(tmpdir(), 'hermes-loop-tests-'))
+
+// The optional integration test uses the explicitly selected host's built session module.
+const hostSessionModule = process.env.DSH_SESSION_MODULE
 
 const require = createRequire(import.meta.url)
 const plugin = require('../src/index.js')
@@ -251,6 +255,72 @@ function setupPlugin(config, services) {
 }
 
 const completedTurn = { type: 'turn/end', data: { reason: { kind: 'completed' } } }
+
+async function captureReviewMessages() {
+  const messages = []
+  const errors = []
+  const services = fakeServices('```json\n{"action":"nothing"}\n```')
+  const originalCreate = services.agents.create
+  services.agents.create = async (opts) => {
+    const handle = await originalCreate(opts)
+    handle.agent.followup = (message) => {
+      messages.push(message)
+      try {
+        assert.equal(typeof message.id, 'string', 'followup id must be a string')
+        assert.ok(message.id.length > 0, 'followup id must be nonempty')
+        assert.equal(message.role, 'user')
+        assert.deepEqual(message.source, { kind: 'user' })
+        assert.ok(message.content[0].text.includes('contract input'))
+      } catch (error) { errors.push(error); throw error }
+    }
+    return handle
+  }
+  const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'log-only' }, services)
+  for (const id of ['contract-one', 'contract-two']) {
+    t.fire({ id, header: {}, deriveMessages: () => [{ role: 'user', content: 'contract input' }] }, completedTurn)
+    await new Promise((r) => setTimeout(r, 100))
+  }
+  assert.equal(messages.length, 2)
+  if (errors.length) throw errors[0]
+  assert.notEqual(messages[0].id, messages[1].id)
+  return messages
+}
+
+test('review followup supplies identified user messages', async () => {
+  await captureReviewMessages()
+})
+
+test('real host appends and replays review and notice messages', { skip: hostSessionModule ? false : 'set DSH_SESSION_MODULE to the built host session module' }, async () => {
+  const { Session, SessionId } = await import(pathToFileURL(hostSessionModule).href)
+  const messages = await captureReviewMessages()
+  for (const message of messages) {
+    const event = { type: 'user/message', seq: 0, time: 1, surfaceOp: 'append', data: message }
+    const replay = Session.create(SessionId('contract-replay'), [event])
+    assert.deepEqual(replay.snapshotEvents()[0].data, message)
+  }
+  const home = await mkdtemp(join(tmpdir(), 'hermes-host-notice-'))
+  const oldHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const host = Session.create(SessionId('notice-host'), [])
+    const conclusion = JSON.stringify({ action: 'create', skill: 'host-notice', description: 'd', body: 'b' })
+    const t = setupPlugin({ turnInterval: 1, cooldownMinutes: 0, mode: 'auto' }, fakeServices('```json\n' + conclusion + '\n```'))
+    t.fire({ id: 'notice-source', header: {}, deriveMessages: () => [], append: (...args) => host.append(...args) }, completedTurn)
+    await new Promise((r) => setTimeout(r, 100))
+    const notice = host.snapshotEvents().find((event) => event.type === 'user/message')
+    assert.ok(notice, t.warns.join('|'))
+    assert.equal(notice.surfaceOp, 'append')
+    assert.equal(notice.data.role, 'user')
+    assert.ok(notice.data.id)
+    assert.equal(notice.data.source.plugin, 'hermes-loop')
+    const replay = Session.create(SessionId('notice-replay'), host.snapshotEvents())
+    assert.deepEqual(replay.snapshotEvents().find((event) => event.type === 'user/message').data, notice.data)
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
 
 test('loop end-to-end: threshold fires review, log-only mode logs the conclusion', async () => {
   const conclusion = JSON.stringify({ action: 'nothing', rationale: 'one-off task' })
@@ -645,12 +715,16 @@ test('write outcomes echo a plugin-notice user/message into the source session',
       id: 'session-echo',
       header: {},
       deriveMessages: () => [],
-      append: (type, data) => { notices.push({ type, data }) },
+      append: (type, data, options) => { notices.push({ type, data, options }) },
     }
     t.fire(session, completedTurn)
     await new Promise((r) => setTimeout(r, 100))
     assert.equal(notices.length, 1)
     assert.equal(notices[0].type, 'user/message')
+    assert.equal(typeof notices[0].data.id, 'string')
+    assert.ok(notices[0].data.id.length > 0)
+    assert.equal(notices[0].data.role, 'user')
+    assert.deepEqual(notices[0].options, { surfaceOp: 'append' })
     assert.equal(notices[0].data.source.kind, 'plugin')
     assert.equal(notices[0].data.source.plugin, 'hermes-loop')
     assert.equal(notices[0].data.source.form, 'notice')
